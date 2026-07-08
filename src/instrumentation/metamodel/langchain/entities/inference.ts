@@ -1,11 +1,9 @@
-import { AGENT_PREFIX_KEY, INFERENCE_AGENT_DELEGATION, INFERENCE_COMMUNICATION, INFERENCE_TOOL_CALL, SPAN_TYPES } from "../../../common/constants";
+import { INFERENCE_TOOL_CALL, INFERENCE_TURN_END, SPAN_TYPES } from "../../../common/constants";
 import { mapLangchainFinishReasonToFinishType } from "../../finishType";
 import {
   extractAssistantMessage,
   getExceptionMessage,
   getLlmMetadata,
-  getStatus,
-  getStatusCode,
 } from "../../utils";
 import { context } from "@opentelemetry/api";
 
@@ -65,8 +63,32 @@ function extractFinishReason(args) {
   return "";
 }
 
+// Classifies a call as a tool-call dispatch vs. a normal end-of-turn response;
+// exposed as span.subtype. Checks the AIMessage's `.tool_calls` and finish reason.
+function classifyInferenceSubtype(response: any): string {
+  try {
+    if (response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) {
+      return INFERENCE_TOOL_CALL;
+    }
+    const finishReason = extractFinishReason(response);
+    if (
+      finishReason === "tool_calls" ||
+      finishReason === "function_call" ||
+      finishReason === "tool_use"
+    ) {
+      return INFERENCE_TOOL_CALL;
+    }
+  } catch (e) {
+    console.warn("Warning: Error occurred in classifyInferenceSubtype:", e);
+  }
+  return INFERENCE_TURN_END;
+}
+
 export const config = {
   "type": SPAN_TYPES.INFERENCE_FRAMEWORK,
+  subtype: function ({ response, output }: any) {
+    return classifyInferenceSubtype(response ?? output);
+  },
   "attributes": [
     [
       {
@@ -167,18 +189,6 @@ export const config = {
             }
           },
         },
-        {
-          "attribute": "status",
-          "accessor": (args) => {
-            return getStatus(args);
-          },
-        },
-        {
-          "attribute": "status_code",
-          "accessor": (args) => {
-            return getStatusCode(args);
-          },
-        },
       ],
     },
     {
@@ -204,30 +214,6 @@ export const config = {
             const finishReason = extractFinishReason(response);
             return mapLangchainFinishReasonToFinishType(finishReason);
           }
-        },
-        {
-          "attribute": "inference_sub_type",
-          "accessor": function ({ response }) {
-            try {
-              let currentContext = context.active();
-              const agentPrefix = currentContext.getValue(AGENT_PREFIX_KEY);
-              if (agentPrefix) {
-                const prefixString = typeof agentPrefix === 'symbol' ? agentPrefix.description : agentPrefix;
-                if (response && 'tool_calls' in response && response.tool_calls) {
-                  const toolCall = response.tool_calls.length > 0 ? response.tool_calls[0] : null;
-                  if (toolCall && 'name' in toolCall && prefixString && toolCall.name.startsWith(prefixString)) {
-                    return INFERENCE_AGENT_DELEGATION;
-                  } else {
-                    return INFERENCE_TOOL_CALL;
-                  }
-                }
-              }
-              return INFERENCE_COMMUNICATION;
-            } catch (e) {
-              console.warn("Warning: Error occurred in agent_inference_type:", e);
-              return null;
-            }
-          },
         },
       ],
     },
