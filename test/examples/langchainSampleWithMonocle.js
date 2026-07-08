@@ -52,7 +52,10 @@ langchainInvoke = setScopesBind({
 
 // Only run if this file is being executed directly (not imported)
 
-async function main() {
+// `question` defaults to the sample question so tests (which import and call
+// main() with no args) stay deterministic. When run from the CLI the question
+// is taken from user input via argv instead of only the hardcoded default.
+async function main(question = "What is coffee?") {
 
   try {
     const validModel = new ChatOpenAI({});
@@ -62,8 +65,8 @@ async function main() {
       openAIApiKey: "INVALID_KEY",
     });
 
-    await langchainInvoke("What is coffee?", validModel);
-    await langchainInvoke("What is coffee?", invalidModel);
+    await langchainInvoke(question, validModel);
+    await langchainInvoke(question, invalidModel);
   } catch (e) {
     console.error("Error during langchainInvoke:", e);
   }
@@ -72,7 +75,9 @@ async function main() {
 if (require.main === module) {
   (async () => {
       try {
-        await main();
+        // Read the question from user input (CLI args); fall back to the default.
+        const question = process.argv.slice(2).join(" ") || undefined;
+        await main(question);
       } catch (e) {
         console.error("Error during processing:", e);
       }
