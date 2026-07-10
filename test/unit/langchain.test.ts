@@ -354,6 +354,25 @@ describe('LangChain inference metadata extraction', () => {
         });
     });
 
+    it('computes total_tokens when the usage object omits it (Anthropic)', () => {
+        // Anthropic's response_metadata.usage carries input/output but no total.
+        const response = { response_metadata: { usage: { input_tokens: 43, output_tokens: 105 } } };
+        expect(usageAccessor({ response, instance: {} })).toMatchObject({
+            input_tokens: 43,
+            output_tokens: 105,
+            total_tokens: 148,
+        });
+    });
+
+    it('computes total_tokens from prompt/completion when omitted', () => {
+        const response = { response_metadata: { tokenUsage: { promptTokens: 10, completionTokens: 4 } } };
+        expect(usageAccessor({ response, instance: {} })).toMatchObject({
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+        });
+    });
+
     it('reads finish_reason from response_metadata (OpenAI snake_case)', () => {
         const response = { response_metadata: { finish_reason: 'stop' } };
         expect(finishReason({ response })).toBe('stop');

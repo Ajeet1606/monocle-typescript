@@ -219,6 +219,16 @@ export function getLlmMetadata({ response, instance }) {
             if ('output_tokens' in tokenUsage || 'outputTokens' in tokenUsage) {
                 metaDict['output_tokens'] = tokenUsage.output_tokens || tokenUsage.outputTokens;
       }
+
+            // Some providers (e.g. Anthropic) report only input/output tokens and
+            // omit the total — derive it so total_tokens is always present.
+            if (metaDict['total_tokens'] == null) {
+                const promptTokens = metaDict['prompt_tokens'] ?? metaDict['input_tokens'];
+                const completionTokens = metaDict['completion_tokens'] ?? metaDict['output_tokens'];
+                if (promptTokens != null || completionTokens != null) {
+                    metaDict['total_tokens'] = (promptTokens || 0) + (completionTokens || 0);
+                }
+            }
     }
   }
 
