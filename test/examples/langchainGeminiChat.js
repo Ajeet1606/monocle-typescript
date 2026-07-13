@@ -60,7 +60,7 @@ async function langchainGeminiChat(model) {
 async function main() {
   try {
       const validClient = new ChatGoogleGenerativeAI({
-        model: "gemini-1.5-pro",
+        model: "gemini-2.5-flash",
         maxOutputTokens: 2048,
         temperature: 0.7,
       });
