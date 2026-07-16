@@ -59,5 +59,5 @@ describe('Gemini Sample', () => {
 
         // Verify count matches
         expect(sortedCapturedLogs.length).toBe(sortedExpectedSpans.length);
-    });
+    }, 120000);
 });

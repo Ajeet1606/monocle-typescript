@@ -206,12 +206,17 @@ export const LANGCHAIN_FINISH_REASON_MAPPING: Record<string, string> = {
     // Anthropic reasons
     "end_turn": FinishType.SUCCESS,
     "stop_sequence": FinishType.SUCCESS,
-    
+
     // Gemini reasons
     "STOP": FinishType.SUCCESS,
     "SAFETY": FinishType.CONTENT_FILTER,
     "RECITATION": FinishType.CONTENT_FILTER,
     "OTHER": FinishType.ERROR,
+
+    // Bedrock (Converse) stopReason values
+    "tool_use": FinishType.SUCCESS,
+    "content_filtered": FinishType.CONTENT_FILTER,
+    "guardrail_intervened": FinishType.CONTENT_FILTER,
 };
 
 export const TEAMSAI_FINISH_REASON_MAPPING: Record<string, string> = {
