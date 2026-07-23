@@ -59,6 +59,10 @@ describe('Mastra AGENT_REQUEST schema', () => {
             expect(input([[{ role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }]]))
                 .toEqual([JSON.stringify({ user: 'a b' })]);
         });
+        it('handles AI SDK UI messages with a parts array (useChat / playground)', () => {
+            expect(input([[{ role: 'user', parts: [{ type: 'text', text: 'weather in Paris?' }] }]]))
+                .toEqual([JSON.stringify({ user: 'weather in Paris?' })]);
+        });
         it('returns [] for empty/absent input', () => {
             expect(input([])).toEqual([]);
             expect(input([null])).toEqual([]);

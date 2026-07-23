@@ -48,7 +48,7 @@ describe('wrapper deferred completion (stream lifetime)', () => {
 
         const patched = getPatchedMain(element);
         const original = function () { return streamResult; };
-        const returned = patched(original).call({}, 'hello');
+        const returned = (patched(original) as any).call({}, 'hello');
 
         // Caller gets the live streaming object synchronously.
         expect(returned).toBe(streamResult);
@@ -65,6 +65,55 @@ describe('wrapper deferred completion (stream lifetime)', () => {
         expect(processSpan).toHaveBeenCalled();
         const call = processSpan.mock.calls[0][0];
         expect(call.returnValue).toEqual({ text: 'final answer' });
+        expect(span.end).toHaveBeenCalled();
+    });
+
+    // Real @mastra/core@1.x shape: stream() returns Promise<MastraModelOutput>.
+    // The Promise branch must still resolve the deferred completion (getFullOutput)
+    // instead of post-processing the un-consumed streaming object.
+    it('resolves a Promise-wrapped streaming object via getFullOutput', async () => {
+        const span = makeMockSpan();
+        let resolveFull: (v: any) => void;
+        const fullOutput = new Promise((r) => { resolveFull = r; });
+        const streamResult = { getFullOutput: () => fullOutput, textStream: {} };
+
+        const processSpan = vi.fn();
+        const handler: any = {
+            skipSpan: () => false,
+            preTracing: (_e: any, ctx: any) => ctx,
+            setDefaultMonocleAttributes: vi.fn(),
+            setWorkflowProperties: vi.fn(),
+            postProcessSpan: vi.fn(),
+            processSpan,
+            resolveCompletion: ({ returnValue }: any) =>
+                (returnValue && typeof returnValue.getFullOutput === 'function') ? returnValue.getFullOutput() : null,
+        };
+
+        const element: any = {
+            package: '@mastra/core/agent', object: 'Agent', method: 'stream',
+            spanName: 'mastra.agent.stream', tracer: makeTracer(span),
+            spanHandler: handler, output_processor: [{ type: 'agentic.turn' }],
+        };
+
+        const patched = getPatchedMain(element);
+        // stream() returns a Promise that resolves to the streaming object.
+        const original = function () { return Promise.resolve(streamResult); };
+        const returned: any = (patched(original) as any).call({}, 'hello');
+
+        // Caller gets a Promise resolving to the live streaming object.
+        expect(typeof returned.then).toBe('function');
+        expect(await returned).toBe(streamResult);
+
+        // Output not processed until generation completes.
+        expect(processSpan).not.toHaveBeenCalled();
+
+        resolveFull!({ text: 'final answer' });
+        await fullOutput;
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(processSpan).toHaveBeenCalled();
+        expect(processSpan.mock.calls[0][0].returnValue).toEqual({ text: 'final answer' });
         expect(span.end).toHaveBeenCalled();
     });
 });

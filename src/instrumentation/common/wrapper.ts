@@ -217,7 +217,16 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
 
             if (typeof returnValue === 'object' && returnValue !== null && typeof returnValue.then === "function") {
                 returnValue = returnValue.then((result: any) => {
-                    endSpan();
+                    // If the resolved value defers completion (e.g. Mastra stream()
+                    // → getFullOutput()), end the workflow span when generation
+                    // finishes — not at stream setup — so it stays aligned with the
+                    // child turn span (otherwise they flush into separate files).
+                    const completion = resolveCompletionOnce(spanHandler, result);
+                    if (completion && typeof completion.then === "function") {
+                        completion.then(() => endSpan()).catch(() => endSpan());
+                    } else {
+                        endSpan();
+                    }
                     return result;
                 }).catch((error: any) => {
                     endSpan();
@@ -321,7 +330,27 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                 }
                 else if (typeof returnValue === 'object' && returnValue !== null && typeof returnValue.then === "function") {
                     returnValue = returnValue.then((result: any) => {
-                        postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: result, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                        // The resolved value may itself be a deferred-completion object
+                        // whose final output isn't ready yet — e.g. Mastra stream()
+                        // returns Promise<MastraModelOutput>, and the text is only
+                        // available via getFullOutput(). Post-process off that completion
+                        // so data.output is the final response; otherwise use the value.
+                        const completion = resolveCompletionOnce(spanHandler, result);
+                        if (completion && typeof completion.then === "function") {
+                            completion
+                                .then((full: any) => {
+                                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: full, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                                })
+                                .catch((error: any) => {
+                                    span.setStatus({ code: 2, message: error?.message || "Error occurred" });
+                                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
+                                    if (span.isRecording()) {
+                                        span.end();
+                                    }
+                                });
+                        } else {
+                            postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: result, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                        }
                         return result;
                     }).catch((error: any) => {
                         span.setStatus({ code: 2, message: error?.message || "Error occurred" });

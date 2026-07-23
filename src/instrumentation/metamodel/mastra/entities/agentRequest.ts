@@ -17,9 +17,9 @@ function extractContentText(content: any): string {
 }
 
 // Mastra's generate()/stream() take the messages as args[0]: a string, or an
-// array of strings / { role, content } messages (content may be a string or an
-// array of text parts). Normalize each to a {role: text} JSON string, matching
-// ADK's extractUserInput shape.
+// array of strings / message objects. The text lives on `.content` (string or
+// text parts) OR `.parts` (AI SDK UI messages, e.g. from useChat / the Mastra
+// playground). Normalize each to a {role: text} JSON string.
 function extractUserInput(args: any[]): string[] {
     const messages = args?.[0];
     if (messages == null) return [];
@@ -31,7 +31,7 @@ function extractUserInput(args: any[]): string[] {
             continue;
         }
         const role = m?.role || "user";
-        const text = extractContentText(m?.content);
+        const text = extractContentText(m?.content ?? m?.parts);
         if (text) out.push(JSON.stringify({ [role]: text }));
     }
     return out;
