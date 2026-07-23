@@ -152,6 +152,34 @@ function processSpanWithTracing(
 
 }
 
+// A deferred-completion return (e.g. Mastra's MastraModelOutput) is seen twice
+// in one turn: once in the child span branch and once in the root/workflow
+// branch. Resolve the handler's completion promise a single time and cache it
+// (non-enumerably) on the return object so we never invoke it — e.g.
+// getFullOutput() — more than once per turn. A synchronous throw degrades to
+// null (span ends normally) rather than leaking an open span.
+const MONOCLE_COMPLETION_PROMISE_KEY = Symbol("monocle.completion_promise");
+
+function resolveCompletionOnce(spanHandler: SpanHandler, returnValue: any): Promise<any> | null {
+    if (!spanHandler.resolveCompletion) return null;
+    const compute = () => {
+        try { return spanHandler.resolveCompletion!({ returnValue }); }
+        catch { return null; }
+    };
+    if (returnValue && typeof returnValue === "object") {
+        const cached = returnValue[MONOCLE_COMPLETION_PROMISE_KEY];
+        if (cached !== undefined) return cached;
+        const completion = compute();
+        try {
+            Object.defineProperty(returnValue, MONOCLE_COMPLETION_PROMISE_KEY, {
+                value: completion, enumerable: false, configurable: true, writable: true,
+            });
+        } catch { /* frozen/sealed object: fall through (may recompute) */ }
+        return completion;
+    }
+    return compute();
+}
+
 function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisArg, args, original, shouldAddWorkflowSpan, sourcePath }: { currentContext: any, tracer: Tracer, element: WrapperArguments, spanHandler: SpanHandler, thisArg: () => any, args: any, original: Function, shouldAddWorkflowSpan: boolean, sourcePath: string }) {
     let returnValue: any;
     let ex: any = null;
@@ -209,6 +237,15 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                         endSpan();
                     }
                 })();
+            }
+            else if (spanHandler.resolveCompletion) {
+                const workflowCompletion = resolveCompletionOnce(spanHandler, returnValue);
+                if (workflowCompletion && typeof workflowCompletion.then === "function") {
+                    workflowCompletion.then(() => endSpan()).catch(() => endSpan());
+                }
+                else {
+                    endSpan();
+                }
             }
             else {
                 endSpan();
@@ -296,7 +333,28 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                     });
                 }
                 else {
-                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                    const completion = resolveCompletionOnce(spanHandler, returnValue);
+                    if (completion && typeof completion.then === "function") {
+                        // Deferred-completion return (e.g. Mastra stream()):
+                        // hand the live object back to the caller now, but end
+                        // the span only when generation finishes.
+                        const liveReturn = returnValue;
+                        completion
+                            .then((result: any) => {
+                                postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: result, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                            })
+                            .catch((error: any) => {
+                                span.setStatus({ code: 2, message: error?.message || "Error occurred" });
+                                postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
+                                if (span.isRecording()) {
+                                    span.end();
+                                }
+                            });
+                        returnValue = liveReturn;
+                    }
+                    else {
+                        postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                    }
                 }
             }
         }

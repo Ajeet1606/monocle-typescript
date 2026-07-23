@@ -97,6 +97,10 @@ export const ADK_AGENT_NAME_KEY = Symbol("agent.adk");
 // Runner wrappers (e.g. Runner.runEphemeral → Runner.runAsync internally, or
 // AgentTool's inner Runner) skip creating a duplicate agentic.turn span.
 export const ADK_TURN_SPAN_ACTIVE_KEY = Symbol("monocle.adk.turn_span_active");
+// Marks "a Mastra turn span is already open in this trace tree" so nested
+// agent invocations (agent-as-tool, workflow steps, or generate() delegating
+// internally to the streaming loop) skip creating a duplicate agentic.turn span.
+export const MASTRA_TURN_SPAN_ACTIVE_KEY = Symbol("monocle.mastra.turn_span_active");
 // Set by ADKAgentSpanHandler.preTracing on a delegated sub-agent invocation
 // (when the previous agent on the context isn't the current agent). Read by
 // the AGENT schema's from_agent / from_agent_span_id accessors.
