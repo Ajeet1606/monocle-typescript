@@ -34,3 +34,25 @@ export const combinedPackages: MethodConfig[] = [
   ...adkPackages,
   ...mastraPackages
 ];
+
+// Bare package name from a possibly-subpath specifier.
+// "@mastra/core/agent" -> "@mastra/core"; "openai/resources/..." -> "openai".
+export function getBarePackageName(spec: string): string {
+  if (spec.startsWith("@")) {
+    return spec.split("/").slice(0, 2).join("/");
+  }
+  return spec.split("/")[0];
+}
+
+// Bare package names Monocle instruments, derived from the enabled metamodels.
+// Single runtime source of truth for the hook audit and the withMonocle sync test.
+export function getInstrumentedPackageNames(): string[] {
+  return Array.from(
+    new Set(
+      combinedPackages
+        .map((p) => (p as any).package)
+        .filter((pkg: unknown): pkg is string => typeof pkg === "string")
+        .map(getBarePackageName)
+    )
+  );
+}
