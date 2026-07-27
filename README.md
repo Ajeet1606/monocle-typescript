@@ -71,7 +71,7 @@ node --import monocle2ai/register app.js
 tsx  --import monocle2ai/register app.ts
 ```
 
-Or set it once in `.env` and launch with `--env-file` (Node reads `NODE_OPTIONS` at
+Or set it once in `.env` and launch (Node reads `NODE_OPTIONS` at
 startup, so this preloads before your app graph loads):
 
 ```
@@ -80,7 +80,7 @@ NODE_OPTIONS=--import monocle2ai/register
 MONOCLE_WORKFLOW_NAME=my-app        # service name used by monocle2ai/register
 ```
 ```
-node --env-file=.env app.js
+node app.js
 ```
 
 A plain top-of-file `import` of your setup is **not** enough in ESM: the whole import
@@ -92,17 +92,28 @@ then. Use the preload above (or `mastra dev` / Next.js integration below).
 Two small, standard touches — no `--import`/`NODE_OPTIONS` needed (Next's
 instrumentation hook is the preload):
 
-1. `next.config.ts` — wrap with `withMonocle`. A bundler would otherwise inline
-   Monocle and the instrumented packages, leaving nothing to hook. `withMonocle`
-   keeps them external (it externalizes a curated set of safe backend SDKs by
-   default; pass app-specific ones via `externalPackages`):
+1. `next.config.ts` — wrap your config with `withMonocle`. A bundler would otherwise
+   inline Monocle and the instrumented packages, leaving nothing to hook.
+   `withMonocle` keeps them external (it externalizes a curated set of safe backend
+   SDKs by default; pass app-specific ones via `externalPackages`):
 
    ```ts
+   import type { NextConfig } from "next";
    import { withMonocle } from "monocle2ai/next";
+
+   const nextConfig: NextConfig = {
+     /* your Next.js config options here (optional) */
+   };
+
    export default withMonocle(nextConfig, {
+     // instrumented packages your app uses that aren't in the safe defaults
      externalPackages: ["@mastra/core", "@mastra/ai-sdk", "@mastra/loggers"],
    });
    ```
+
+   Your `nextConfig` is merged in, so any options you add there are preserved
+   (including your own `serverExternalPackages` / `webpack`, which `withMonocle`
+   unions with its additions).
 
 2. `src/instrumentation.ts` — Next runs `register()` before your app; set up Monocle there:
 
