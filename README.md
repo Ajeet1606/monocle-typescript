@@ -46,7 +46,23 @@ Monocle instruments GenAI libraries (OpenAI, LangChain, LlamaIndex, Mastra, …)
 hooking them **at module load**, so Monocle must be set up **before your app imports
 those libraries**. How you arrange that depends on your runtime.
 
-### Node / tsx scripts
+### CommonJS (CJS) apps
+
+The classic setup still works for CommonJS apps — call `setupMonocle` at the top of
+your entry file, before requiring the instrumented libraries:
+
+```js
+const { setupMonocle } = require("monocle2ai");
+setupMonocle("your-app-name");
+
+const OpenAI = require("openai"); // required AFTER setupMonocle → hooked
+```
+
+`require` runs synchronously in order, so a top-of-file `setupMonocle` registers the
+hooks (via require-in-the-middle) before the libraries load — no preload flag needed.
+The ESM ordering caveat below does **not** apply to CommonJS.
+
+### Node / tsx scripts (ESM)
 
 Preload the built-in register entry — no instrumentation file to write:
 
