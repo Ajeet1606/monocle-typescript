@@ -17,9 +17,10 @@ function extractContentText(content: any): string {
 }
 
 // Mastra's generate()/stream() take the messages as args[0]: a string, or an
-// array of strings / message objects. The text lives on `.content` (string or
-// text parts) OR `.parts` (AI SDK UI messages, e.g. from useChat / the Mastra
-// playground). Normalize each to a {role: text} JSON string.
+// array / single message object. The text may live on `.content` (string or
+// text parts), `.parts` (AI SDK UI messages), or `.contents` (Mastra message
+// signals from the playground); role may be on `.role` or `.type`. Normalize
+// each to a {role: text} JSON string.
 function extractUserInput(args: any[]): string[] {
     const messages = args?.[0];
     if (messages == null) return [];
@@ -30,8 +31,8 @@ function extractUserInput(args: any[]): string[] {
             if (m) out.push(JSON.stringify({ user: m }));
             continue;
         }
-        const role = m?.role || "user";
-        const text = extractContentText(m?.content ?? m?.parts);
+        const role = m?.role || m?.type || "user";
+        const text = extractContentText(m?.content ?? m?.parts ?? m?.contents);
         if (text) out.push(JSON.stringify({ [role]: text }));
     }
     return out;

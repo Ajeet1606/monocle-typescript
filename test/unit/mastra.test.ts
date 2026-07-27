@@ -63,6 +63,12 @@ describe('Mastra AGENT_REQUEST schema', () => {
             expect(input([[{ role: 'user', parts: [{ type: 'text', text: 'weather in Paris?' }] }]]))
                 .toEqual([JSON.stringify({ user: 'weather in Paris?' })]);
         });
+        it('handles a Mastra message signal (contents + type, single object)', () => {
+            // Shape the Studio playground passes: a single signal object, text on
+            // `contents`, role on `type`.
+            expect(input([{ contents: 'weather in paris', type: 'user', tagName: 'user', __isCreatedSignal: true }]))
+                .toEqual([JSON.stringify({ user: 'weather in paris' })]);
+        });
         it('returns [] for empty/absent input', () => {
             expect(input([])).toEqual([]);
             expect(input([null])).toEqual([]);
