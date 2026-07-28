@@ -16,7 +16,7 @@ export const config = [
         method: "create",
         spanName: "openai_embeddings",
         output_processor: [retrievalConfig],
-        spanHandler: new OpenAISpanHandler()
+        spanHandler: new OpenAISpanHandler({ deferToFrameworkSpan: false })
     },
     {
         package: "openai/resources/responses/responses",

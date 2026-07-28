@@ -332,6 +332,18 @@ export const config = {
 }
 
 export class OpenAISpanHandler extends NonFrameworkSpanHandler {
+    // Deferring only makes sense when the framework emits its own span carrying
+    // the same data. That holds for chat/responses calls, but not for
+    // embeddings: a framework's retriever span reports the retrieved documents,
+    // never the embedding model or the vector, so those spans must keep their
+    // own "retrieval" processing even under a framework workflow.
+    private readonly deferToFrameworkSpan: boolean;
+
+    constructor({ deferToFrameworkSpan = true }: { deferToFrameworkSpan?: boolean } = {}) {
+        super();
+        this.deferToFrameworkSpan = deferToFrameworkSpan;
+    }
+
     isTeamsSpanInProgress() {
         const currentActiveWorkflowType = context.active().getValue(WORKFLOW_TYPE_KEY_SYMBOL) || WORKFLOW_TYPE_GENERIC;
         return currentActiveWorkflowType === "workflow.teams_ai"
@@ -346,6 +358,9 @@ export class OpenAISpanHandler extends NonFrameworkSpanHandler {
         args: IArguments;
         element: WrapperArguments;
     }) {
+        if (!this.deferToFrameworkSpan) {
+            return false;
+        }
         if (this.isTeamsSpanInProgress()) {
             return true;
         }
@@ -362,7 +377,7 @@ export class OpenAISpanHandler extends NonFrameworkSpanHandler {
         exception?: any;
         parentSpan?: Span;
     }) {
-        if (this.isTeamsSpanInProgress() && !exception) {
+        if (this.deferToFrameworkSpan && this.isTeamsSpanInProgress() && !exception) {
             super.processSpan({
                 span: parentSpan,
                 instance,
@@ -391,7 +406,7 @@ export class OpenAISpanHandler extends NonFrameworkSpanHandler {
         // Under a framework workflow, mark this as the model-API span so it
         // isn't treated as a second primary inference span. Direct calls keep
         // the schema's default "inference" type.
-        if (this.checkActiveWorkflowType()) {
+        if (this.deferToFrameworkSpan && this.checkActiveWorkflowType()) {
             span.setAttribute("span.type", "inference.modelapi");
         }
 
