@@ -48,6 +48,18 @@ export const WORKFLOW_TYPE_GENERIC = "workflow.generic"
 export const MONOCLE_SDK_VERSION = "monocle_apptrace.version"
 export const MONOCLE_DETECTED_SPAN_ERROR = "monocle_apptrace.detected_span_error"
 
+// Default service/workflow name when the app doesn't supply one (e.g. the
+// `monocle2ai/register` preload reading MONOCLE_WORKFLOW_NAME).
+export const DEFAULT_WORKFLOW_NAME = "monocle-app"
+
+// Agentic scope names shared across framework metamodels (ADK, Mastra, ...).
+//   agentic.session    — one user session/thread (multiple turns share this)
+//   agentic.turn       — one agent turn (e.g. Runner.runAsync / Agent.generate)
+//   agentic.invocation — one agent activation within a turn
+export const SCOPE_AGENTIC_SESSION = "agentic.session"
+export const SCOPE_AGENTIC_TURN = "agentic.turn"
+export const SCOPE_AGENTIC_INVOCATION = "agentic.invocation"
+
 // # Azure environment constants
 const AZURE_ML_ENDPOINT_ENV_NAME = "AZUREML_ENTRY_SCRIPT"
 const AZURE_FUNCTION_WORKER_ENV_NAME = "FUNCTIONS_WORKER_RUNTIME"

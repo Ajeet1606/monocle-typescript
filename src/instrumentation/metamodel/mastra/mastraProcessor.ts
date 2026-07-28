@@ -1,12 +1,12 @@
 import { context } from "@opentelemetry/api";
-import { MASTRA_TURN_SPAN_ACTIVE_KEY, WrapperArguments } from "../../common/constants";
+import {
+    MASTRA_TURN_SPAN_ACTIVE_KEY,
+    SCOPE_AGENTIC_SESSION,
+    SCOPE_AGENTIC_TURN,
+    WrapperArguments,
+} from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
 import { getScopeFromContext, updateBaggageContextWithScopes } from "../../common/utils";
-
-//   agentic.session — one user session/thread (multiple turns share this)
-//   agentic.turn    — one agent.generate()/stream() call
-const SCOPE_AGENTIC_SESSION = "agentic.session";
-const SCOPE_AGENTIC_TURN = "agentic.turn";
 
 // Best-effort read of an app-supplied session/thread id from the agent call
 // options (args[1]). Monocle never fabricates one — if the app doesn't pass it,

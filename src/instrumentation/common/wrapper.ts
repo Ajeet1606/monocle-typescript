@@ -180,6 +180,27 @@ function resolveCompletionOnce(spanHandler: SpanHandler, returnValue: any): Prom
     return compute();
 }
 
+// Bridges a possibly-deferred return value to a settle callback. If the value
+// defers completion (its final result is only available via the span handler's
+// resolveCompletion(), e.g. Mastra's MastraModelOutput.getFullOutput()),
+// `onSettled` runs with the final resolved value when generation finishes and
+// `onError` runs if it rejects; otherwise `onSettled` runs synchronously with
+// the value as-is. Extracted so the completion call sites in handleSpanProcess
+// share one implementation.
+function withResolvedCompletion(
+    spanHandler: SpanHandler,
+    value: any,
+    onSettled: (finalValue: any) => void,
+    onError: (error: any) => void,
+): void {
+    const completion = resolveCompletionOnce(spanHandler, value);
+    if (completion && typeof completion.then === "function") {
+        completion.then((finalValue: any) => onSettled(finalValue)).catch((error: any) => onError(error));
+    } else {
+        onSettled(value);
+    }
+}
+
 function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisArg, args, original, shouldAddWorkflowSpan, sourcePath }: { currentContext: any, tracer: Tracer, element: WrapperArguments, spanHandler: SpanHandler, thisArg: () => any, args: any, original: Function, shouldAddWorkflowSpan: boolean, sourcePath: string }) {
     let returnValue: any;
     let ex: any = null;
@@ -221,12 +242,7 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                     // → getFullOutput()), end the workflow span when generation
                     // finishes — not at stream setup — so it stays aligned with the
                     // child turn span (otherwise they flush into separate files).
-                    const completion = resolveCompletionOnce(spanHandler, result);
-                    if (completion && typeof completion.then === "function") {
-                        completion.then(() => endSpan()).catch(() => endSpan());
-                    } else {
-                        endSpan();
-                    }
+                    withResolvedCompletion(spanHandler, result, () => endSpan(), () => endSpan());
                     return result;
                 }).catch((error: any) => {
                     endSpan();
@@ -247,17 +263,11 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                     }
                 })();
             }
-            else if (spanHandler.resolveCompletion) {
-                const workflowCompletion = resolveCompletionOnce(spanHandler, returnValue);
-                if (workflowCompletion && typeof workflowCompletion.then === "function") {
-                    workflowCompletion.then(() => endSpan()).catch(() => endSpan());
-                }
-                else {
-                    endSpan();
-                }
-            }
             else {
-                endSpan();
+                // Plain return, or a deferred-completion return (e.g. Mastra
+                // stream()): end the workflow span now, or when generation
+                // finishes if the value defers completion.
+                withResolvedCompletion(spanHandler, returnValue, () => endSpan(), () => endSpan());
             }
         }
         else {
@@ -274,6 +284,19 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                     && typeof returnValue === 'object'
                     && typeof returnValue.then !== "function"
                     && typeof returnValue[Symbol.asyncIterator] === 'function';
+
+                // Shared post-processing for the non-async-iterable branches: run
+                // the output processor with the final value, or record the error
+                // and end the span. Deferred-completion returns (Mastra stream())
+                // resolve their final value first via withResolvedCompletion.
+                const postProcessResult = (finalValue: any) => postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: finalValue, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
+                const postProcessFailure = (error: any) => {
+                    span.setStatus({ code: 2, message: error?.message || "Error occurred" });
+                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
+                    if (span.isRecording()) {
+                        span.end();
+                    }
+                };
 
                 if (isAsyncIterable) {
                     // The original returned an AsyncGenerator (e.g. ADK runAsync).
@@ -335,55 +358,20 @@ function handleSpanProcess({ currentContext, tracer, element, spanHandler, thisA
                         // returns Promise<MastraModelOutput>, and the text is only
                         // available via getFullOutput(). Post-process off that completion
                         // so data.output is the final response; otherwise use the value.
-                        const completion = resolveCompletionOnce(spanHandler, result);
-                        if (completion && typeof completion.then === "function") {
-                            completion
-                                .then((full: any) => {
-                                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: full, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
-                                })
-                                .catch((error: any) => {
-                                    span.setStatus({ code: 2, message: error?.message || "Error occurred" });
-                                    postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
-                                    if (span.isRecording()) {
-                                        span.end();
-                                    }
-                                });
-                        } else {
-                            postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: result, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
-                        }
+                        withResolvedCompletion(spanHandler, result, postProcessResult, postProcessFailure);
                         return result;
                     }).catch((error: any) => {
-                        span.setStatus({ code: 2, message: error?.message || "Error occurred" });
-                        postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
-                        if (span.isRecording()) {
-                            span.end();
-                        }
+                        postProcessFailure(error);
                         throw error;
                     });
                 }
                 else {
-                    const completion = resolveCompletionOnce(spanHandler, returnValue);
-                    if (completion && typeof completion.then === "function") {
-                        // Deferred-completion return (e.g. Mastra stream()):
-                        // hand the live object back to the caller now, but end
-                        // the span only when generation finishes.
-                        const liveReturn = returnValue;
-                        completion
-                            .then((result: any) => {
-                                postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: result, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
-                            })
-                            .catch((error: any) => {
-                                span.setStatus({ code: 2, message: error?.message || "Error occurred" });
-                                postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue: error, element, args: args, sourcePath, exception: error || ex, parentSpan, currentContext });
-                                if (span.isRecording()) {
-                                    span.end();
-                                }
-                            });
-                        returnValue = liveReturn;
-                    }
-                    else {
-                        postProcessSpanData({ instance: thisArg, spanHandler, span, returnValue, element, args: args, sourcePath, exception: ex, parentSpan, currentContext });
-                    }
+                    // Plain return, or a deferred-completion return (e.g. Mastra
+                    // stream()): hand the live object back to the caller now, but
+                    // post-process off the final value when generation finishes.
+                    const liveReturn = returnValue;
+                    withResolvedCompletion(spanHandler, returnValue, postProcessResult, postProcessFailure);
+                    returnValue = liveReturn;
                 }
             }
         }
