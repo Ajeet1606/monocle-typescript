@@ -1,5 +1,7 @@
 import { MethodConfig } from "../../common/constants";
+import { DefaultSpanHandler } from "../../common/spanHandler";
 import { AGENT_REQUEST } from "./entities/agentRequest";
+import { INFERENCE } from "./entities/inference";
 import { MastraTurnSpanHandler } from "./mastraProcessor";
 
 // Agent.generate() (one-shot) and Agent.stream() (streaming) are exported
@@ -8,6 +10,15 @@ import { MastraTurnSpanHandler } from "./mastraProcessor";
 // Patching here covers direct app usage AND Mastra's internally-created agents.
 // Each call is one agentic turn.
 const MASTRA_AGENT_PACKAGE = "@mastra/core/agent";
+
+// Mastra normalizes every model (router strings AND raw AI-SDK objects) into an
+// AI-SDK LanguageModelV2 wrapper. ModelRouterLanguageModel is exported from
+// @mastra/core/llm and is the single choke point for router-string models:
+// agent.generate() → the agentic loop → model.doGenerate(). One wrap here yields
+// one inference span per LLM call, for every provider (read off modelId /
+// provider). NOTE: agent.stream() → model.doStream() is a follow-up (streaming
+// output must be observed non-destructively off the returned ReadableStream).
+const MASTRA_LLM_PACKAGE = "@mastra/core/llm";
 
 export const config: MethodConfig[] = [
     {
@@ -25,5 +36,17 @@ export const config: MethodConfig[] = [
         spanName: "mastra.agent.stream",
         spanHandler: new MastraTurnSpanHandler(),
         output_processor: [AGENT_REQUEST],
+    } as unknown as MethodConfig,
+    {
+        // DefaultSpanHandler: used when the span is not part of a larger agentic turn (e.g. when the LLM is called directly, outside of an agentic loop). This ensures that the span is still created and processed correctly, even if it is not part of a larger agentic turn.
+        // (NOT NonFrameworkSpanHandler): used when the span is part of a larger agentic turn (e.g. when the LLM is called from within an agentic loop). This ensures that the span is created and processed correctly, and that it is linked to the parent span of the agentic turn.
+        // here our span is part of a larger agentic turn but mastra doesn't emit any inference spans for the LLM call, so we use DefaultSpanHandler to ensure that the span is still created and processed correctly.
+        
+        package: MASTRA_LLM_PACKAGE,
+        object: "ModelRouterLanguageModel",
+        method: "doGenerate",
+        spanName: "mastra.model.generate",
+        spanHandler: new DefaultSpanHandler(),
+        output_processor: [INFERENCE],
     } as unknown as MethodConfig,
 ];

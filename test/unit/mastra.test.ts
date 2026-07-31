@@ -7,6 +7,8 @@ import { MastraTurnSpanHandler } from '../../src/instrumentation/metamodel/mastr
 import { MASTRA_TURN_SPAN_ACTIVE_KEY } from '../../src/instrumentation/common/constants';
 import { getScopeFromContext } from '../../src/instrumentation/common/utils';
 import { config as mastraConfig } from '../../src/instrumentation/metamodel/mastra/methods';
+import { INFERENCE } from '../../src/instrumentation/metamodel/mastra/entities/inference';
+import { SPAN_TYPES, INFERENCE_TOOL_CALL, INFERENCE_TURN_END } from '../../src/instrumentation/common/constants';
 
 function attrAccessor(schema: any, attribute: string, group = 0): Function {
     const found = schema.attributes[group].find((a: any) => a.attribute === attribute);
@@ -136,5 +138,158 @@ describe('Mastra methods config', () => {
             expect(entry.output_processor[0].type).toBe('agentic.turn');
             expect(entry.spanHandler.constructor.name).toBe('MastraTurnSpanHandler');
         }
+    });
+
+    it('wraps ModelRouterLanguageModel.doGenerate on @mastra/core/llm as an inference span', () => {
+        const entry = (mastraConfig as any[]).find((c) => c.method === 'doGenerate');
+        expect(entry).toBeDefined();
+        expect(entry.package).toBe('@mastra/core/llm');
+        expect(entry.object).toBe('ModelRouterLanguageModel');
+        expect(entry.output_processor[0].type).toBe('inference');
+        expect(entry.spanHandler.constructor.name).toBe('DefaultSpanHandler');
+    });
+});
+
+// =============================================================================
+// INFERENCE schema — inference (mastra.model.generate)
+// =============================================================================
+describe('Mastra INFERENCE schema', () => {
+    it('declares the inference type', () => {
+        expect(INFERENCE.type).toBe(SPAN_TYPES.INFERENCE);
+    });
+
+    describe('subtype (from finishReason)', () => {
+        const subtype = (response: any) => (INFERENCE.subtype as Function)({ response });
+        it('classifies a tool-calls finish as a tool_call inference', () => {
+            expect(subtype({ finishReason: 'tool-calls' })).toBe(INFERENCE_TOOL_CALL);
+        });
+        it('classifies stop / length / missing as turn_end', () => {
+            expect(subtype({ finishReason: 'stop' })).toBe(INFERENCE_TURN_END);
+            expect(subtype({ finishReason: 'length' })).toBe(INFERENCE_TURN_END);
+            expect(subtype(undefined)).toBe(INFERENCE_TURN_END);
+        });
+        it('handles the Mastra nested finishReason shape ({ unified })', () => {
+            expect(subtype({ finishReason: { unified: 'tool-calls' } })).toBe(INFERENCE_TOOL_CALL);
+            expect(subtype({ finishReason: { unified: 'stop' } })).toBe(INFERENCE_TURN_END);
+        });
+    });
+
+    describe('model attributes (entity 1, off the wrapper instance)', () => {
+        it('type is model.llm.<modelId> and name is modelId', () => {
+            expect(attrAccessor(INFERENCE, 'type', 0)({ instance: { modelId: 'gpt-5-mini' } })).toBe('model.llm.gpt-5-mini');
+            expect(attrAccessor(INFERENCE, 'name', 0)({ instance: { modelId: 'gpt-5-mini' } })).toBe('gpt-5-mini');
+        });
+    });
+
+    describe('provider type + endpoint (entity 2)', () => {
+        const provType = (provider: string) => attrAccessor(INFERENCE, 'type', 1)({ instance: { provider } });
+        it('maps router provider ids to inference.<provider>', () => {
+            expect(provType('openai')).toBe('inference.openai');
+            expect(provType('anthropic')).toBe('inference.anthropic');
+            expect(provType('google')).toBe('inference.gemini');
+            expect(provType('amazon-bedrock')).toBe('inference.aws_bedrock');
+        });
+        it('falls back to inference.generic when provider is absent', () => {
+            expect(provType('')).toBe('inference.generic');
+        });
+        it('extracts a best-effort inference endpoint, undefined when unavailable', () => {
+            const endpoint = (instance: any) => attrAccessor(INFERENCE, 'inference_endpoint', 1)({ instance });
+            expect(endpoint({ config: { baseURL: 'https://api.openai.com/v1' } })).toBe('https://api.openai.com/v1');
+            expect(endpoint({ gatewayId: 'models.dev' })).toBe('models.dev');
+            expect(endpoint({})).toBeUndefined();
+        });
+    });
+
+    describe('tools declared (entity 3)', () => {
+        const toolNames = (args: any[]) => attrAccessor(INFERENCE, 'name', 2)({ args });
+        const toolType = (args: any[]) => attrAccessor(INFERENCE, 'type', 2)({ args });
+        it('lists declared function-tool names and marks the tool type', () => {
+            const args = [{ tools: [{ type: 'function', name: 'get_weather' }, { type: 'function', name: 'get_time' }] }];
+            expect(toolNames(args)).toBe('get_weather, get_time');
+            expect(toolType(args)).toBe('tool.function');
+        });
+        it('omits the tools entity when no tools are declared', () => {
+            expect(toolNames([{}])).toBeUndefined();
+            expect(toolType([{}])).toBeUndefined();
+        });
+    });
+
+    describe('data.input (LanguageModelV2 prompt)', () => {
+        const input = (args: any[]) => eventAccessor(INFERENCE, 'data.input', 'input')({ args });
+        it('extracts system string content and user text parts', () => {
+            const prompt = [
+                { role: 'system', content: 'You are helpful.' },
+                { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+            ];
+            expect(input([{ prompt }])).toEqual([
+                JSON.stringify({ system: 'You are helpful.' }),
+                JSON.stringify({ user: 'hi' }),
+            ]);
+        });
+        it('serializes assistant tool-call and tool-result parts (tool-using turns)', () => {
+            const prompt = [
+                { role: 'assistant', content: [{ type: 'tool-call', toolName: 'get_weather', input: '{"city":"NYC"}' }] },
+                { role: 'tool', content: [{ type: 'tool-result', toolName: 'get_weather', output: 'sunny' }] },
+            ];
+            expect(input([{ prompt }])).toEqual([
+                JSON.stringify({ assistant: JSON.stringify({ tool_call: { name: 'get_weather', arguments: '{"city":"NYC"}' } }) }),
+                JSON.stringify({ tool: JSON.stringify({ tool_result: { name: 'get_weather', output: 'sunny' } }) }),
+            ]);
+        });
+        it('returns [] when there is no prompt', () => {
+            expect(input([{}])).toEqual([]);
+            expect(input([])).toEqual([]);
+        });
+    });
+
+    describe('data.output (result.content)', () => {
+        const output = (bag: any) => eventAccessor(INFERENCE, 'data.output', 'response')(bag);
+        it('joins text parts from content', () => {
+            expect(output({ response: { content: [{ type: 'text', text: 'It is sunny.' }] } })).toBe('It is sunny.');
+        });
+        it('falls back to a serialized tool call when there is no text', () => {
+            expect(output({ response: { content: [{ type: 'tool-call', toolName: 'get_weather', input: '{"city":"NYC"}' }] } }))
+                .toBe(JSON.stringify({ name: 'get_weather', arguments: '{"city":"NYC"}' }));
+        });
+        it('returns the exception message on error', () => {
+            expect(output({ exception: new Error('boom') })).toContain('boom');
+        });
+    });
+
+    describe('metadata (tokens + finish reason)', () => {
+        const metaEvent = () => (INFERENCE.events as any[]).find((e) => e.name === 'metadata');
+        // The token bundle is the metadata attribute with no `attribute` key
+        // (its returned dict is spread onto the event).
+        const tokens = (response: any) => metaEvent().attributes.find((a: any) => !a.attribute).accessor({ response });
+        const meta = (attr: string, response: any) => eventAccessor(INFERENCE, 'metadata', attr)({ response });
+
+        it('extracts flat AI-SDK token numbers', () => {
+            const usage = { inputTokens: 11, outputTokens: 22, totalTokens: 33 };
+            expect(tokens({ usage })).toEqual({ prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 });
+        });
+        it('extracts Mastra nested token objects and computes total', () => {
+            const usage = {
+                inputTokens: { total: 125, cacheRead: 4 },
+                outputTokens: { total: 512, text: 128, reasoning: 384 },
+            };
+            expect(tokens({ usage })).toEqual({
+                prompt_tokens: 125, completion_tokens: 512, total_tokens: 637,
+                reasoning_tokens: 384, cached_tokens: 4,
+            });
+        });
+        it('omits reasoning/cached when zero or absent', () => {
+            const usage = { inputTokens: { total: 5, cacheRead: 0 }, outputTokens: { total: 6 } };
+            expect(tokens({ usage })).toEqual({ prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 });
+        });
+        it('returns undefined when there is no usage', () => {
+            expect(tokens({})).toBeUndefined();
+        });
+        it('reports finish_reason and finish_type from a string or nested { unified }', () => {
+            expect(meta('finish_reason', { finishReason: 'tool-calls' })).toBe('tool-calls');
+            expect(meta('finish_reason', { finishReason: { unified: 'stop' } })).toBe('stop');
+            expect(meta('finish_type', { finishReason: { unified: 'tool-calls' } })).toBe('tool_call');
+            expect(meta('finish_type', { finishReason: 'stop' })).toBe('stop');
+            expect(meta('finish_type', {})).toBe('unknown');
+        });
     });
 });
