@@ -7,7 +7,7 @@ import { MastraTurnSpanHandler } from '../../src/instrumentation/metamodel/mastr
 import { MASTRA_TURN_SPAN_ACTIVE_KEY } from '../../src/instrumentation/common/constants';
 import { getScopeFromContext } from '../../src/instrumentation/common/utils';
 import { config as mastraConfig } from '../../src/instrumentation/metamodel/mastra/methods';
-import { INFERENCE } from '../../src/instrumentation/metamodel/mastra/entities/inference';
+import { INFERENCE, INFERENCE_STREAM } from '../../src/instrumentation/metamodel/mastra/entities/inference';
 import { SPAN_TYPES, INFERENCE_TOOL_CALL, INFERENCE_TURN_END } from '../../src/instrumentation/common/constants';
 
 function attrAccessor(schema: any, attribute: string, group = 0): Function {
@@ -291,5 +291,87 @@ describe('Mastra INFERENCE schema', () => {
             expect(meta('finish_type', { finishReason: 'stop' })).toBe('stop');
             expect(meta('finish_type', {})).toBe('unknown');
         });
+    });
+});
+
+// =============================================================================
+// INFERENCE_STREAM — streaming inference (mastra.model.stream)
+// =============================================================================
+describe('Mastra INFERENCE_STREAM (streaming)', () => {
+    function readableFrom(parts: any[]): ReadableStream {
+        return new ReadableStream({
+            start(c) { for (const p of parts) c.enqueue(p); c.close(); },
+        });
+    }
+    async function drain(stream: ReadableStream): Promise<any[]> {
+        const out: any[] = [];
+        const reader = stream.getReader();
+        while (true) { const { done, value } = await reader.read(); if (done) break; out.push(value); }
+        return out;
+    }
+
+    it('reuses the INFERENCE schema shape and adds a response_processor', () => {
+        expect(INFERENCE_STREAM.type).toBe(SPAN_TYPES.INFERENCE);
+        expect(INFERENCE_STREAM.attributes).toBe(INFERENCE.attributes);
+        expect(INFERENCE_STREAM.events).toBe(INFERENCE.events);
+        expect(typeof (INFERENCE_STREAM as any).response_processor).toBe('function');
+    });
+
+    it('observes text-delta + finish parts non-destructively and finalizes on close', async () => {
+        const parts = [
+            { type: 'stream-start' },
+            { type: 'text-start', id: 'm1' },
+            { type: 'text-delta', id: 'm1', delta: 'Hello' },
+            { type: 'text-delta', id: 'm1', delta: ' world' },
+            { type: 'text-end', id: 'm1' },
+            { type: 'finish', finishReason: { unified: 'stop' }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } } },
+        ];
+        const returnValue: any = { stream: readableFrom(parts) };
+        let finalReturnValue: any;
+        (INFERENCE_STREAM as any).response_processor({
+            returnValue,
+            spanProcessor: ({ finalReturnValue: f }: any) => { finalReturnValue = f; },
+        });
+
+        // The app consumes the (now wrapped) stream — parts pass through unchanged.
+        const seen = await drain(returnValue.stream);
+        expect(seen.map((p: any) => p.type)).toEqual(parts.map((p) => p.type));
+        expect(seen[2].delta).toBe('Hello');
+
+        // finalize ran on close with a synthesized doGenerate-shaped result.
+        expect(finalReturnValue.content).toEqual([{ type: 'text', text: 'Hello world' }]);
+        expect(finalReturnValue.finishReason).toEqual({ unified: 'stop' });
+
+        // The reused INFERENCE accessors read the synthesized result correctly.
+        expect(eventAccessor(INFERENCE_STREAM, 'data.output', 'response')({ response: finalReturnValue })).toBe('Hello world');
+        const tokenAcc = (INFERENCE_STREAM.events as any[]).find((e) => e.name === 'metadata').attributes.find((a: any) => !a.attribute).accessor;
+        expect(tokenAcc({ response: finalReturnValue })).toEqual({ prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 });
+        expect((INFERENCE_STREAM.subtype as Function)({ response: finalReturnValue })).toBe(INFERENCE_TURN_END);
+    });
+
+    it('accumulates a streamed tool-call into the output', async () => {
+        const parts = [
+            { type: 'tool-call', toolName: 'get_weather', input: '{"city":"NYC"}' },
+            { type: 'finish', finishReason: { unified: 'tool-calls' }, usage: { inputTokens: { total: 2 }, outputTokens: { total: 1 } } },
+        ];
+        const returnValue: any = { stream: readableFrom(parts) };
+        let finalReturnValue: any;
+        (INFERENCE_STREAM as any).response_processor({
+            returnValue,
+            spanProcessor: ({ finalReturnValue: f }: any) => { finalReturnValue = f; },
+        });
+        await drain(returnValue.stream);
+        expect(eventAccessor(INFERENCE_STREAM, 'data.output', 'response')({ response: finalReturnValue }))
+            .toContain('get_weather');
+        expect((INFERENCE_STREAM.subtype as Function)({ response: finalReturnValue })).toBe(INFERENCE_TOOL_CALL);
+    });
+
+    it('finalizes immediately for a non-stream return value', () => {
+        let finalReturnValue: any;
+        (INFERENCE_STREAM as any).response_processor({
+            returnValue: { content: [{ type: 'text', text: 'x' }] },
+            spanProcessor: ({ finalReturnValue: f }: any) => { finalReturnValue = f; },
+        });
+        expect(finalReturnValue).toEqual({ content: [{ type: 'text', text: 'x' }] });
     });
 });

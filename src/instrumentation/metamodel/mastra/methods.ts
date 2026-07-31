@@ -1,7 +1,7 @@
 import { MethodConfig } from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
 import { AGENT_REQUEST } from "./entities/agentRequest";
-import { INFERENCE } from "./entities/inference";
+import { INFERENCE, INFERENCE_STREAM } from "./entities/inference";
 import { MastraTurnSpanHandler } from "./mastraProcessor";
 
 // Agent.generate() (one-shot) and Agent.stream() (streaming) are exported
@@ -12,12 +12,10 @@ import { MastraTurnSpanHandler } from "./mastraProcessor";
 const MASTRA_AGENT_PACKAGE = "@mastra/core/agent";
 
 // Mastra normalizes every model (router strings AND raw AI-SDK objects) into an
-// AI-SDK LanguageModelV2 wrapper. ModelRouterLanguageModel is exported from
-// @mastra/core/llm and is the single choke point for router-string models:
-// agent.generate() → the agentic loop → model.doGenerate(). One wrap here yields
-// one inference span per LLM call, for every provider (read off modelId /
-// provider). NOTE: agent.stream() → model.doStream() is a follow-up (streaming
-// output must be observed non-destructively off the returned ReadableStream).
+// AI-SDK LanguageModelV2 wrapper. ModelRouterLanguageModel (exported from
+// @mastra/core/llm) is the single choke point: generate()/stream() → the agentic
+// loop → model.doGenerate()/doStream(). One wrap per method = one inference span
+// per LLM call, for every provider (read off modelId / provider).
 const MASTRA_LLM_PACKAGE = "@mastra/core/llm";
 
 export const config: MethodConfig[] = [
@@ -48,5 +46,16 @@ export const config: MethodConfig[] = [
         spanName: "mastra.model.generate",
         spanHandler: new DefaultSpanHandler(),
         output_processor: [INFERENCE],
+    } as unknown as MethodConfig,
+    {
+        // Streaming counterpart (agent.stream()): INFERENCE_STREAM's
+        // response_processor observes the returned stream and defers the span
+        // until it closes. See entities/inference.ts.
+        package: MASTRA_LLM_PACKAGE,
+        object: "ModelRouterLanguageModel",
+        method: "doStream",
+        spanName: "mastra.model.stream",
+        spanHandler: new DefaultSpanHandler(),
+        output_processor: [INFERENCE_STREAM],
     } as unknown as MethodConfig,
 ];

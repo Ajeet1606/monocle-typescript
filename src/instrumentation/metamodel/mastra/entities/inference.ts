@@ -292,3 +292,80 @@ export const INFERENCE = {
         },
     ],
 };
+
+// Streaming (agent.stream() → model.doStream()). doStream resolves to
+// { stream: ReadableStream }; text/usage/finishReason come from consuming it, so
+// we observe the stream and synthesize a doGenerate-shaped { content, usage,
+// finishReason } and reuse the INFERENCE accessors above.
+
+interface StreamAcc {
+    text: string[];
+    toolCalls: any[];
+    usage: any;
+    finishReason: any;
+}
+
+// Stream part types: text-delta ({ delta }), tool-call, finish ({ usage,
+// finishReason }); markers (stream-start/text-start/…) are ignored.
+function accumulateStreamPart(part: any, acc: StreamAcc): void {
+    const type = part?.type;
+    if (type === "text-delta" && typeof part.delta === "string") {
+        acc.text.push(part.delta);
+    } else if (type === "text" && typeof part.text === "string") {
+        acc.text.push(part.text);
+    } else if (type === "tool-call") {
+        acc.toolCalls.push({ type: "tool-call", toolName: part.toolName, input: part.input });
+    } else if (type === "finish") {
+        acc.usage = part.usage;
+        acc.finishReason = part.finishReason;
+    }
+}
+
+function synthesizeStreamResult(acc: StreamAcc): any {
+    const content: any[] = [];
+    if (acc.text.length) content.push({ type: "text", text: acc.text.join("") });
+    content.push(...acc.toolCalls);
+    return { content, usage: acc.usage, finishReason: acc.finishReason };
+}
+
+// Swaps returnValue.stream for a pass-through that accumulates parts, and defers
+// the span until the stream closes.
+function processMastraStream({ returnValue, spanProcessor }: any): void {
+    const source = returnValue?.stream;
+    // No stream to observe → finalize immediately.
+    if (!source || typeof source.pipeThrough !== "function") {
+        if (spanProcessor) spanProcessor({ finalReturnValue: returnValue });
+        return;
+    }
+
+    const acc: StreamAcc = { text: [], toolCalls: [], usage: null, finishReason: null };
+    let finalized = false;
+    const finalize = () => {
+        if (finalized || !spanProcessor) return;
+        finalized = true;
+        spanProcessor({ finalReturnValue: synthesizeStreamResult(acc) });
+    };
+
+    const observer = new TransformStream({
+        transform(chunk, controller) {
+            try { accumulateStreamPart(chunk, acc); } catch { /* ignore a bad part */ }
+            controller.enqueue(chunk);
+        },
+        flush() {
+            finalize();
+        },
+    });
+
+    try {
+        returnValue.stream = source.pipeThrough(observer);
+    } catch {
+        // Can't swap the stream (frozen) → finalize now instead of leaking a span.
+        finalize();
+    }
+}
+
+// INFERENCE + the stream-accumulating response_processor.
+export const INFERENCE_STREAM = {
+    ...INFERENCE,
+    response_processor: processMastraStream,
+};
