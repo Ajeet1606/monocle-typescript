@@ -174,15 +174,8 @@ describe('Mastra INFERENCE schema', () => {
         });
     });
 
-    describe('model attributes (entity 1, off the wrapper instance)', () => {
-        it('type is model.llm.<modelId> and name is modelId', () => {
-            expect(attrAccessor(INFERENCE, 'type', 0)({ instance: { modelId: 'gpt-5-mini' } })).toBe('model.llm.gpt-5-mini');
-            expect(attrAccessor(INFERENCE, 'name', 0)({ instance: { modelId: 'gpt-5-mini' } })).toBe('gpt-5-mini');
-        });
-    });
-
-    describe('provider type + endpoint (entity 2)', () => {
-        const provType = (provider: string) => attrAccessor(INFERENCE, 'type', 1)({ instance: { provider } });
+    describe('provider type + endpoint (entity 1)', () => {
+        const provType = (provider: string) => attrAccessor(INFERENCE, 'type', 0)({ instance: { provider } });
         it('maps router provider ids to inference.<provider>', () => {
             expect(provType('openai')).toBe('inference.openai');
             expect(provType('anthropic')).toBe('inference.anthropic');
@@ -193,10 +186,17 @@ describe('Mastra INFERENCE schema', () => {
             expect(provType('')).toBe('inference.generic');
         });
         it('extracts a best-effort inference endpoint, undefined when unavailable', () => {
-            const endpoint = (instance: any) => attrAccessor(INFERENCE, 'inference_endpoint', 1)({ instance });
+            const endpoint = (instance: any) => attrAccessor(INFERENCE, 'inference_endpoint', 0)({ instance });
             expect(endpoint({ config: { baseURL: 'https://api.openai.com/v1' } })).toBe('https://api.openai.com/v1');
             expect(endpoint({ gatewayId: 'models.dev' })).toBe('models.dev');
             expect(endpoint({})).toBeUndefined();
+        });
+    });
+
+    describe('model attributes (entity 2, off the wrapper instance)', () => {
+        it('type is model.llm.<modelId> and name is modelId', () => {
+            expect(attrAccessor(INFERENCE, 'type', 1)({ instance: { modelId: 'gpt-5-mini' } })).toBe('model.llm.gpt-5-mini');
+            expect(attrAccessor(INFERENCE, 'name', 1)({ instance: { modelId: 'gpt-5-mini' } })).toBe('gpt-5-mini');
         });
     });
 
