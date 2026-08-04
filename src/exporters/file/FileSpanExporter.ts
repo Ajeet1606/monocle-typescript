@@ -20,10 +20,10 @@ interface FileSpanExporterConfig {
 const DEFAULT_FILE_PREFIX = "monocle_trace_";
 const DEFAULT_TRACE_FOLDER = ".monocle";
 const HANDLE_TIMEOUT_MS = 60 * 1000;
-// A trace's file closes this long after its last span. Replaces the old
-// "close as soon as the root span is seen" rule, which assumed the root ends
-// last — untrue whenever a framework emits post-turn spans (Mastra scorers,
-// LLM-as-judge evals, late streaming flushes).
+// Backstop only. A trace's file normally closes the moment its root span is
+// written (see _processSpans), so it is valid JSON immediately. This timer
+// catches traces that never emit a root span, and closes the file this long
+// after their last span.
 //
 // It must comfortably exceed the batch processor's flush interval
 // (MONOCLE_EXPORTER_DELAY, default 5s). If they're equal, a multi-batch trace
@@ -48,6 +48,20 @@ interface OpenTraceFile {
     // Next byte to write at. Tracked explicitly because a reopened file starts
     // positioned over the trailing ']' rather than at end-of-file.
     writeOffset: number;
+    // True when this handle came from reopening an already-closed trace. Such a
+    // trace was closed because we believed it was finished, so any late span is
+    // flushed and the file re-closed at once instead of being held open.
+    reopened?: boolean;
+}
+
+function getParentSpanId(span: any): string | undefined {
+    return span?.parentSpanContext?.spanId ?? span?.parentSpanId;
+}
+
+function isRootSpan(span: any): boolean {
+    const parentId = getParentSpanId(span);
+    if (!parentId || parentId === 'None') return true;
+    return span?.attributes?.['span.type'] === 'workflow';
 }
 
 function formatTimestamp(date: Date): string {
@@ -240,6 +254,7 @@ class FileSpanExporter {
                 createdAt: Date.now(),
                 isFirstSpan: tail.toString('utf8')[0] === '[',
                 writeOffset: size - 1, // overwrite the ']'
+                reopened: true,
             };
             this.fileHandles.set(traceId, entry);
             this.closedTraces.delete(traceId);
@@ -306,12 +321,14 @@ class FileSpanExporter {
     private _processSpans(spans, done) {
         try {
             const spansByTrace = new Map<string, any[]>();
+            const rootSpanTraces = new Set<string>();
 
             for (const span of spans) {
                 const traceId: string | undefined = span?.spanContext?.().traceId;
                 if (!traceId) continue;
                 if (!spansByTrace.has(traceId)) spansByTrace.set(traceId, []);
                 spansByTrace.get(traceId)!.push(span);
+                if (isRootSpan(span)) rootSpanTraces.add(traceId);
             }
 
             for (const [traceId, traceSpans] of spansByTrace) {
@@ -334,10 +351,19 @@ class FileSpanExporter {
                     }
                 }
 
-                // Keep the file open for further spans on this trace; close once
-                // it goes quiet. Never close on "root span seen" — the root is
-                // not guaranteed to end last.
-                this._resetIdleTimer(traceId);
+                if (rootSpanTraces.has(traceId) || entry.reopened) {
+                    // Either the root span just landed, or this is a late span on
+                    // a trace we already considered finished. Close now so the
+                    // file is valid JSON immediately rather than after the idle
+                    // window. Safe to close early because anything that still
+                    // arrives (async scorers, late flushes) reopens this exact
+                    // file and appends, rather than starting a second one.
+                    this._closeTraceHandle(traceId);
+                } else {
+                    // No root span yet: keep the file open and let the backstop
+                    // timer close it if the trace never produces one.
+                    this._resetIdleTimer(traceId);
+                }
             }
 
             if (typeof done === 'function') {

@@ -73,6 +73,43 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         ]);
     });
 
+    // The trace file must be readable the moment the trace ends — not after the
+    // idle window. Waiting 15s meant anyone opening the file in an editor right
+    // after a query saw a JSON syntax error.
+    it('closes the file as soon as the root span is written', () => {
+        const exporter: any = new FileSpanExporter({
+            outPath,
+            serviceName: 'weather-agent',
+            formatter,
+            idleTimeoutMs: 60_000, // must not be what saves us
+        });
+
+        exporter.export(
+            [
+                mkSpan('2222222222222222', 'mastra.model.stream.answer', ROOT_SPAN),
+                mkSpan(ROOT_SPAN, 'mastra.agent.stream', undefined, 'workflow'),
+            ],
+            () => {},
+        );
+
+        // No sleep, no shutdown() — valid right now.
+        const files = traceFiles(outPath);
+        expect(files).toHaveLength(1);
+        expect(readTrace(outPath, files[0]).parsed).toHaveLength(2);
+
+        // A late scorer lands in that same file — and the file is valid again
+        // straight away, without waiting for the idle window or shutdown().
+        exporter.export([mkSpan('4444444444444444', 'mastra.model.stream.scorer', ROOT_SPAN)], () => {});
+
+        expect(traceFiles(outPath)).toEqual(files);
+        const { parsed } = readTrace(outPath, files[0]);
+        expect(parsed).toHaveLength(3);
+        expect(parsed.map((s) => s.spanId)).toContain('4444444444444444');
+
+        exporter.shutdown();
+        expect(readTrace(outPath, files[0]).parsed).toHaveLength(3); // no double-write
+    });
+
     it('leaves valid JSON on disk once the trace goes idle', async () => {
         const exporter: any = new FileSpanExporter({
             outPath,
@@ -146,7 +183,9 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         });
 
         const listenersBefore = process.listeners('exit').length;
-        exporter.export([mkSpan(ROOT_SPAN, 'mastra.agent.stream', undefined, 'workflow')], () => {});
+        // A child span only — no root span, so nothing closes the file eagerly
+        // and the exit hook is the only thing that can terminate it.
+        exporter.export([mkSpan('2222222222222222', 'mastra.model.stream', ROOT_SPAN)], () => {});
 
         const added = process.listeners('exit').slice(listenersBefore);
         expect(added.length).toBeGreaterThan(0);
