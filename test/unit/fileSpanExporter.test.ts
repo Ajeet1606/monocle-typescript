@@ -44,8 +44,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         rmSync(outPath, { recursive: true, force: true });
     });
 
-    // The Mastra weather-agent case: the turn completes (root + 2 inference spans),
-    // then an async scorer's inference span arrives ~66ms later on the same trace.
+    // The Mastra weather-agent case: an async scorer's span arrives ~66ms after
+    // the turn already completed.
     it('keeps a scorer span that arrives after the root in the same trace file', () => {
         const exporter: any = new FileSpanExporter({ outPath, serviceName: 'weather-agent', formatter });
 
@@ -73,9 +73,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         ]);
     });
 
-    // The trace file must be readable the moment the trace ends — not after the
-    // idle window. Waiting 15s meant anyone opening the file in an editor right
-    // after a query saw a JSON syntax error.
+    // The file must be readable the moment the trace ends. Waiting for the idle
+    // window meant opening it right after a query showed a JSON syntax error.
     it('closes the file as soon as the root span is written', () => {
         const exporter: any = new FileSpanExporter({
             outPath,
@@ -171,9 +170,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         expect(total).toBe(2); // nothing lost
     });
 
-    // Nothing in Monocle calls shutdown() on process exit and the idle timer is
-    // unref'd, so the exporter must close its files on the way out or a
-    // short-lived script leaves a trace file without its closing ']'.
+    // Nothing calls shutdown() on exit and the idle timer is unref'd, so the
+    // exporter must close its files on the way out.
     it('closes open trace files when the process exits', () => {
         const exporter: any = new FileSpanExporter({
             outPath,
@@ -202,9 +200,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         exporter.shutdown(); // detaches the hook
     });
 
-    // Writes now use explicit byte offsets, so any mismatch between string
-    // length and UTF-8 byte length would corrupt the file. LLM traces carry
-    // arbitrary prompt/response text, so this is the common case, not an edge.
+    // Writes use explicit byte offsets, so a string-length vs byte-length mix-up
+    // would corrupt the file. LLM traces are full of non-ASCII text.
     it('writes correct offsets for multi-byte UTF-8 span content', () => {
         const exporter: any = new FileSpanExporter({ outPath, serviceName: 'weather-agent', formatter });
 
@@ -232,8 +229,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         ]);
     });
 
-    // Same check, but across a close/reopen boundary — the reopen seeks to
-    // size-1, which is a byte offset, not a character offset.
+    // Same check across a close/reopen boundary: the reopen seeks to size-1,
+    // a byte offset.
     it('appends correctly after reopen when the file contains multi-byte text', async () => {
         const exporter: any = new FileSpanExporter({
             outPath,
@@ -254,9 +251,8 @@ describe('FileSpanExporter — late spans on an already-ended trace', () => {
         expect(parsed.map((s) => s.name)).toEqual(['東京の天気 ☀️', 'Москва 🌧️']);
     });
 
-    // A trace whose spans are further apart than the idle window closes and
-    // reopens mid-trace. It must still end up as one valid file — this is the
-    // slow-chain case (LangChain/LlamaIndex retrieval gaps), not scorer-specific.
+    // Spans further apart than the idle window close and reopen mid-trace and
+    // must still land in one file — the slow-chain case, not scorer-specific.
     it('keeps a slow trace in one file across multiple idle closes', async () => {
         const exporter: any = new FileSpanExporter({
             outPath,

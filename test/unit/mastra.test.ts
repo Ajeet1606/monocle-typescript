@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { context, ROOT_CONTEXT } from '@opentelemetry/api';
 import { AsyncHooksContextManager } from '@opentelemetry/context-async-hooks';
 import { AGENT_REQUEST } from '../../src/instrumentation/metamodel/mastra/entities/agentRequest';
@@ -7,6 +7,11 @@ import { MastraTurnSpanHandler } from '../../src/instrumentation/metamodel/mastr
 import { MASTRA_TURN_SPAN_ACTIVE_KEY } from '../../src/instrumentation/common/constants';
 import { getScopeFromContext } from '../../src/instrumentation/common/utils';
 import { config as mastraConfig } from '../../src/instrumentation/metamodel/mastra/methods';
+import { TOOL } from '../../src/instrumentation/metamodel/mastra/entities/tool';
+import { mastraToolWrapper } from '../../src/instrumentation/metamodel/mastra/mastraProcessor';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { trace } from '@opentelemetry/api';
 import { INFERENCE, INFERENCE_STREAM } from '../../src/instrumentation/metamodel/mastra/entities/inference';
 import { SPAN_TYPES, INFERENCE_TOOL_CALL, INFERENCE_TURN_END } from '../../src/instrumentation/common/constants';
 
@@ -373,5 +378,197 @@ describe('Mastra INFERENCE_STREAM (streaming)', () => {
             spanProcessor: ({ finalReturnValue: f }: any) => { finalReturnValue = f; },
         });
         expect(finalReturnValue).toEqual({ content: [{ type: 'text', text: 'x' }] });
+    });
+});
+
+describe('Mastra TOOL schema', () => {
+    it('declares the agentic.tool.invocation type', () => {
+        expect(TOOL.type).toBe(SPAN_TYPES.AGENTIC_TOOL_INVOCATION);
+    });
+
+    it('reads tool name and description from the tool instance', () => {
+        const instance = { id: 'get-weather', description: 'Get current weather for a location' };
+        expect(attrAccessor(TOOL, 'type')({})).toBe('tool.mastra');
+        expect(attrAccessor(TOOL, 'name')({ instance })).toBe('get-weather');
+        expect(attrAccessor(TOOL, 'description')({ instance })).toBe('Get current weather for a location');
+    });
+
+    it('returns empty strings when the tool has no id or description', () => {
+        expect(attrAccessor(TOOL, 'name')({ instance: {} })).toBe('');
+        expect(attrAccessor(TOOL, 'description')({ instance: {} })).toBe('');
+    });
+
+    it('reads the owning agent from the stamp the wrapper leaves on the tool', () => {
+        const instance = { id: 'get-weather', __monocleAgent: { name: 'Weather Agent' } };
+        expect(attrAccessor(TOOL, 'name', 1)({ instance })).toBe('Weather Agent');
+        expect(attrAccessor(TOOL, 'type', 1)({})).toBe('agent.mastra');
+    });
+
+    it('leaves the agent name empty when the tool was never stamped', () => {
+        expect(attrAccessor(TOOL, 'name', 1)({ instance: { id: 'x' } })).toBe('');
+    });
+
+    it('records the model-produced args as data.input', () => {
+        const acc = eventAccessor(TOOL, 'data.input', 'Inputs');
+        expect(acc({ args: [{ location: 'Tokyo' }] })).toEqual([JSON.stringify({ location: 'Tokyo' })]);
+    });
+
+    it('records an empty input when the tool takes no args', () => {
+        expect(eventAccessor(TOOL, 'data.input', 'Inputs')({ args: [] })).toEqual(['']);
+    });
+
+    it('records the tool result as data.output', () => {
+        const acc = eventAccessor(TOOL, 'data.output', 'response');
+        expect(acc({ response: { temperature: 21 } })).toBe(JSON.stringify({ temperature: 21 }));
+        expect(acc({ response: 'sunny' })).toBe('sunny');
+        expect(acc({ response: undefined })).toBe('');
+    });
+
+    it('records the exception message when the tool throws', () => {
+        const acc = eventAccessor(TOOL, 'data.output', 'response');
+        expect(acc({ exception: new Error('geocoding failed') })).toContain('geocoding failed');
+    });
+});
+
+describe('mastraToolWrapper', () => {
+    let provider: NodeTracerProvider;
+    let memExporter: InMemorySpanExporter;
+    let tracer: any;
+
+    const toolElement: any = {
+        package: '@mastra/core/agent',
+        object: 'Agent',
+        method: 'convertTools',
+    };
+
+    const makeAgent = (name = 'Weather Agent') => ({ id: 'weather-agent', name });
+
+    // Mirrors _patchMainMethodName's 7-arg contract: the wrapper replaces the
+    // call and invokes `wrapped` itself.
+    const runWrapper = (original: Function, agent: any = makeAgent()) =>
+        mastraToolWrapper(tracer, undefined, toolElement, original, agent, '', [{}]);
+
+    // Without a real context manager, context.with() is a no-op and span
+    // creation recurses.
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    beforeEach(() => {
+        memExporter = new InMemorySpanExporter();
+        provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(memExporter)] });
+        tracer = provider.getTracer('test');
+    });
+
+    afterEach(async () => {
+        await provider.shutdown();
+    });
+
+    it('returns the original tool map', async () => {
+        const original = async () => ({ 'get-weather': { id: 'get-weather', execute: async () => 'sunny' } });
+        const out: any = await runWrapper(original);
+        expect(Object.keys(out)).toEqual(['get-weather']);
+    });
+
+    it('replaces execute and still returns the tool result', async () => {
+        const tool: any = { id: 'get-weather', execute: async (input: any) => `weather for ${input.location}` };
+        const originalExecute = tool.execute;
+        const out: any = await runWrapper(async () => ({ 'get-weather': tool }));
+
+        expect(out['get-weather'].execute).not.toBe(originalExecute);
+        await expect(out['get-weather'].execute({ location: 'Tokyo' })).resolves.toBe('weather for Tokyo');
+    });
+
+    it('emits a mastra.tool span when the tool is executed', async () => {
+        const tool: any = { id: 'get-weather', description: 'Get weather', execute: async () => 'sunny' };
+        const out: any = await runWrapper(async () => ({ 'get-weather': tool }));
+
+        expect(memExporter.getFinishedSpans()).toHaveLength(0); // nothing yet — acquisition is not traced
+        await out['get-weather'].execute({ location: 'Tokyo' });
+
+        // Two spans: the tool span plus the workflow root Monocle synthesizes
+        // when nothing encloses it.
+        const spans = memExporter.getFinishedSpans();
+        const toolSpan: any = spans.find((s: any) => s.name === 'mastra.tool');
+        expect(toolSpan).toBeDefined();
+        expect(toolSpan.attributes['span.type']).toBe(SPAN_TYPES.AGENTIC_TOOL_INVOCATION);
+        expect(toolSpan.attributes['entity.1.name']).toBe('get-weather');
+        expect(toolSpan.attributes['entity.1.type']).toBe('tool.mastra');
+        expect(toolSpan.attributes['entity.2.name']).toBe('Weather Agent');
+        expect(toolSpan.events.map((e: any) => e.name)).toEqual(
+            expect.arrayContaining(['data.input', 'data.output']),
+        );
+    });
+
+    it('parents the tool span under the active span at execution time', async () => {
+        const tool: any = { id: 'get-weather', execute: async () => 'sunny' };
+        const out: any = await runWrapper(async () => ({ 'get-weather': tool }));
+
+        const turn = tracer.startSpan('mastra.agent.stream');
+        await context.with(trace.setSpan(context.active(), turn), () =>
+            out['get-weather'].execute({ location: 'Tokyo' }),
+        );
+        turn.end();
+
+        const spans = memExporter.getFinishedSpans();
+        const toolSpan = spans.find((s: any) => s.name === 'mastra.tool');
+        // Narrows the type and fails readably if the span was never emitted.
+        if (!toolSpan) throw new Error('no mastra.tool span was emitted');
+
+        expect((toolSpan as any).parentSpanContext?.spanId ?? (toolSpan as any).parentSpanId)
+            .toBe(turn.spanContext().spanId);
+        expect(toolSpan.spanContext().traceId).toBe(turn.spanContext().traceId);
+    });
+
+    it('stamps the owning agent onto each tool', async () => {
+        const out: any = await runWrapper(
+            async () => ({ 'get-weather': { id: 'get-weather', execute: async () => 1 } }),
+            makeAgent('Weather Agent'),
+        );
+        expect(out['get-weather'].__monocleAgent).toEqual({ name: 'Weather Agent', id: 'weather-agent' });
+    });
+
+    it('does not double-wrap a tool that passed through before', async () => {
+        const tool: any = { id: 'get-weather', execute: async () => 1 };
+        const first: any = await runWrapper(async () => ({ 'get-weather': tool }));
+        const wrappedOnce = first['get-weather'].execute;
+
+        const second: any = await runWrapper(async () => first);
+        expect(second['get-weather'].execute).toBe(wrappedOnce);
+    });
+
+    it('leaves tools without a function execute untouched', async () => {
+        const out: any = await runWrapper(async () => ({ 'no-exec': { id: 'no-exec' } }));
+        expect(out['no-exec'].execute).toBeUndefined();
+    });
+
+    it('propagates a rejection from convertTools', async () => {
+        await expect(
+            runWrapper(async () => { throw new Error('tool resolution failed'); }),
+        ).rejects.toThrow('tool resolution failed');
+    });
+
+    it('survives a non-object return without throwing', async () => {
+        await expect(runWrapper(async () => undefined)).resolves.toBeUndefined();
+    });
+});
+
+describe('Mastra tool config entry', () => {
+    it('patches Agent.convertTools with the tool wrapper', () => {
+        const entry: any = mastraConfig.find((c: any) => c.method === 'convertTools');
+        expect(entry).toBeDefined();
+        expect(entry.package).toBe('@mastra/core/agent');
+        expect(entry.object).toBe('Agent');
+        expect(typeof entry.wrapperMethod).toBe('function');
+    });
+
+    it('creates no span for the acquisition call itself', () => {
+        const entry: any = mastraConfig.find((c: any) => c.method === 'convertTools');
+        expect(entry.spanName).toBeUndefined();
+        expect(entry.output_processor).toBeUndefined();
+    });
+
+    it('leaves the existing turn and inference entries intact', () => {
+        const methods = mastraConfig.map((c: any) => c.method).sort();
+        expect(methods).toEqual(['convertTools', 'doGenerate', 'doStream', 'generate', 'stream']);
     });
 });

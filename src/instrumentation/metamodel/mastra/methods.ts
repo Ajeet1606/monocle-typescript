@@ -2,7 +2,7 @@ import { MethodConfig } from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
 import { AGENT_REQUEST } from "./entities/agentRequest";
 import { INFERENCE, INFERENCE_STREAM } from "./entities/inference";
-import { MastraTurnSpanHandler } from "./mastraProcessor";
+import { MastraTurnSpanHandler, mastraToolWrapper } from "./mastraProcessor";
 
 // Agent.generate() (one-shot) and Agent.stream() (streaming) are exported
 // prototype methods on the singleton Agent class; @mastra/core/agent is the
@@ -57,5 +57,17 @@ export const config: MethodConfig[] = [
         spanName: "mastra.model.stream",
         spanHandler: new DefaultSpanHandler(),
         output_processor: [INFERENCE_STREAM],
+    } as unknown as MethodConfig,
+    {
+        // Tools have no patchable method — createTool() returns a plain object
+        // whose execute is a per-instance closure — so mastraToolWrapper wraps
+        // each execute in the tool map convertTools assembles instead.
+        // Not getToolsForExecution: it only delegates here, and just the
+        // agent-as-tool path calls it, so patching it traced nothing.
+        // This call emits no span itself; the tool spans carry the metadata.
+        package: MASTRA_AGENT_PACKAGE,
+        object: "Agent",
+        method: "convertTools",
+        wrapperMethod: mastraToolWrapper,
     } as unknown as MethodConfig,
 ];

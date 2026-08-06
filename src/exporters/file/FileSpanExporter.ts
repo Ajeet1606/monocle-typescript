@@ -20,24 +20,17 @@ interface FileSpanExporterConfig {
 const DEFAULT_FILE_PREFIX = "monocle_trace_";
 const DEFAULT_TRACE_FOLDER = ".monocle";
 const HANDLE_TIMEOUT_MS = 60 * 1000;
-// Backstop only. A trace's file normally closes the moment its root span is
-// written (see _processSpans), so it is valid JSON immediately. This timer
-// catches traces that never emit a root span, and closes the file this long
-// after their last span.
-//
-// It must comfortably exceed the batch processor's flush interval
-// (MONOCLE_EXPORTER_DELAY, default 5s). If they're equal, a multi-batch trace
-// closes in the gap between batches and takes the reopen path on every batch —
-// correct, but needless churn. Derived so tuning the batch delay can't silently
-// break this.
+// Backstop for traces that never emit a root span; the normal close happens on
+// the root span (see _processSpans). Derived rather than fixed so it always
+// exceeds the batch flush interval — if they were equal, every multi-batch trace
+// would close between batches and take the reopen path.
 const MIN_IDLE_TIMEOUT_MS = 15 * 1000;
 function defaultIdleTimeoutMs(): number {
     const batchDelay = parseInt(process.env.MONOCLE_EXPORTER_DELAY ?? '', 10);
     const base = !isNaN(batchDelay) && batchDelay > 0 ? batchDelay : 5000;
     return Math.max(3 * base, MIN_IDLE_TIMEOUT_MS);
 }
-// Cap on remembered traceId -> filePath entries, so a long-lived process can't
-// grow this without bound. Oldest entries are evicted first (Map keeps order).
+// Bounds the traceId -> filePath map; oldest evicted first.
 const MAX_CLOSED_TRACES = 1000;
 
 interface OpenTraceFile {
@@ -45,12 +38,11 @@ interface OpenTraceFile {
     filePath: string;
     createdAt: number;
     isFirstSpan: boolean;
-    // Next byte to write at. Tracked explicitly because a reopened file starts
-    // positioned over the trailing ']' rather than at end-of-file.
+    // Tracked explicitly: a reopened file starts positioned over the trailing
+    // ']', not at end-of-file.
     writeOffset: number;
-    // True when this handle came from reopening an already-closed trace. Such a
-    // trace was closed because we believed it was finished, so any late span is
-    // flushed and the file re-closed at once instead of being held open.
+    // Reopened from an already-closed trace, so late spans are flushed and the
+    // file re-closed at once rather than held open.
     reopened?: boolean;
 }
 
@@ -157,10 +149,8 @@ class FileSpanExporter {
         }
     }
 
-    // Nothing in Monocle calls shutdown() on process exit, and the idle timer is
-    // unref'd, so a process that ends before the timer fires would leave a file
-    // without its closing ']'. Close synchronously on the way out instead —
-    // writeSync/closeSync are legal inside an 'exit' handler.
+    // Nothing calls shutdown() on exit and the idle timer is unref'd, so close
+    // synchronously on the way out — writeSync/closeSync are legal in 'exit'.
     private _installExitHook() {
         if (this._exitHandler) return;
         this._exitHandler = () => this._closeAllHandles();
@@ -194,8 +184,8 @@ class FileSpanExporter {
         const existing = this.fileHandles.get(traceId);
         if (existing) return existing;
 
-        // This trace already had a file (an async scorer/eval span arrived after
-        // it was closed) — append to that file rather than starting a new one.
+        // Late span on a closed trace (async scorer/eval): append to its file
+        // rather than starting a new one.
         const closedPath = this.closedTraces.get(traceId);
         if (closedPath && existsSync(closedPath)) {
             const reopened = this._reopenHandle(traceId, closedPath);
@@ -207,8 +197,8 @@ class FileSpanExporter {
         const fileName = `${this.file_prefix}${serviceName}_${traceId}_${timestamp}.json`;
         const filePath = join(this.outPath, fileName);
 
-        // Belt and braces: the name is second-granular, so if anything already
-        // occupies it, append instead of truncating a completed trace away.
+        // The name is second-granular, so if it's already taken, append rather
+        // than truncate a completed trace away.
         if (existsSync(filePath)) {
             const reopened = this._reopenHandle(traceId, filePath);
             if (reopened) return reopened;
@@ -233,8 +223,8 @@ class FileSpanExporter {
         }
     }
 
-    // Reopen a closed trace file positioned over its trailing ']', so the next
-    // write extends the existing array instead of clobbering the file.
+    // Reopen positioned over the trailing ']' so the next write extends the
+    // array instead of clobbering the file.
     private _reopenHandle(traceId: string, filePath: string): OpenTraceFile | null {
         let fd: number | undefined;
         try {
@@ -275,7 +265,7 @@ class FileSpanExporter {
         entry.writeOffset += Buffer.byteLength(text, 'utf8');
     }
 
-    // A trace is considered finished once no span has arrived for idleTimeoutMs.
+    // A trace is finished once no span has arrived for idleTimeoutMs.
     private _resetIdleTimer(traceId: string) {
         const existing = this.traceTimers.get(traceId);
         if (existing) clearTimeout(existing);
@@ -352,16 +342,12 @@ class FileSpanExporter {
                 }
 
                 if (rootSpanTraces.has(traceId) || entry.reopened) {
-                    // Either the root span just landed, or this is a late span on
-                    // a trace we already considered finished. Close now so the
-                    // file is valid JSON immediately rather than after the idle
-                    // window. Safe to close early because anything that still
-                    // arrives (async scorers, late flushes) reopens this exact
-                    // file and appends, rather than starting a second one.
+                    // Root span landed, or a late span on a trace we already
+                    // considered finished. Close now so the file is valid JSON
+                    // immediately; anything arriving later reopens and appends.
                     this._closeTraceHandle(traceId);
                 } else {
-                    // No root span yet: keep the file open and let the backstop
-                    // timer close it if the trace never produces one.
+                    // No root span yet — hold the file open for the backstop timer.
                     this._resetIdleTimer(traceId);
                 }
             }

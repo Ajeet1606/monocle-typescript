@@ -12,6 +12,8 @@ import { AsyncHooksContextManager } from "@opentelemetry/context-async-hooks";
 import { combinedPackages, getBarePackageName } from "./packages";
 import { ConsoleSpanExporter } from "@opentelemetry/sdk-trace-node";
 import { getPatchedMain, getPatchedScopeMain, getPatchedMainList } from "./wrapper";
+// Must stay a static import: a lazy require() throws in the ESM build.
+import { NonFrameworkSpanHandler } from "./spanHandler";
 import { AWS_CONSTANTS, MethodConfig } from './constants';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -347,7 +349,6 @@ class MonocleInstrumentation extends InstrumentationBase {
         if ((element as any).wrapperMethod && typeof (element as any).wrapperMethod === 'function') {
             return (original: Function) => {
                 return function (this: any, ...args: any[]) {
-                    const { NonFrameworkSpanHandler } = require('./spanHandler');
                     const spanHandler = (element as any).spanHandler || new NonFrameworkSpanHandler();
 
                     return (element as any).wrapperMethod(

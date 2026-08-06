@@ -1,4 +1,4 @@
-import { context } from "@opentelemetry/api";
+import { context, Tracer } from "@opentelemetry/api";
 import {
     MASTRA_TURN_SPAN_ACTIVE_KEY,
     SCOPE_AGENTIC_SESSION,
@@ -7,6 +7,8 @@ import {
 } from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
 import { getScopeFromContext, updateBaggageContextWithScopes } from "../../common/utils";
+import { getPatchedMain } from "../../common/wrapper";
+import { TOOL } from "./entities/tool";
 
 // Best-effort read of an app-supplied session/thread id from the agent call
 // options (args[1]). Monocle never fabricates one — if the app doesn't pass it,
@@ -64,4 +66,62 @@ export class MastraTurnSpanHandler extends DefaultSpanHandler {
         }
         return null;
     }
+}
+
+const MONOCLE_WRAPPED = "_monocleWrapped";
+
+// Wraps each tool's execute in the map Agent.convertTools returns, since Mastra
+// tools expose no prototype method to patch. Mutating the map is safe: Mastra's
+// wrapToolWithHooks hands back `{...tool, execute}`, a fresh copy per call.
+//
+// A wrapperMethod replaces the call (see _patchMainMethodName), so this must
+// invoke `wrapped` itself; convertTools is async, hence the promise chain.
+export function mastraToolWrapper(
+    tracer: Tracer,
+    _spanHandler: any,
+    element: any,
+    wrapped: Function,
+    instance: any,
+    _sourcePath: string,
+    args: any[],
+) {
+    return Promise.resolve(wrapped.apply(instance, args)).then((tools: any) => {
+        if (!tools || typeof tools !== "object") return tools;
+
+        const agentStamp = { name: instance?.name || "", id: instance?.id || "" };
+
+        for (const toolName of Object.keys(tools)) {
+            const tool = tools[toolName];
+            const originalExecute = tool?.execute;
+            if (typeof originalExecute !== "function") continue;
+            // convertTools runs per turn, and the agent-as-tool path re-enters it
+            // with the same objects, so guard against stacking wrappers.
+            if ((originalExecute as any)[MONOCLE_WRAPPED]) continue;
+
+            // Accessors only ever receive the tool as `instance`, never the Agent,
+            // so the agent has to travel on the tool. Non-enumerable to stay out
+            // of tool serialization.
+            Object.defineProperty(tool, "__monocleAgent", {
+                value: agentStamp,
+                enumerable: false,
+                configurable: true,
+                writable: true,
+            });
+
+            const toolElement = {
+                tracer,
+                package: element?.package || "@mastra/core/agent",
+                object: "Tool",
+                method: "execute",
+                spanName: "mastra.tool",
+                output_processor: [TOOL],
+            };
+
+            const wrappedExecute = getPatchedMain(toolElement as any)(originalExecute);
+            (wrappedExecute as any)[MONOCLE_WRAPPED] = true;
+            tool.execute = wrappedExecute;
+        }
+
+        return tools;
+    });
 }
