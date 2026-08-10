@@ -105,6 +105,8 @@ export const service_name_map = {
 
 export const LANGGRAPH_AGENT_NAME_KEY = Symbol("agent.langgraph");
 export const ADK_AGENT_NAME_KEY = Symbol("agent.adk");
+// The agent currently executing, so a nested one can name its delegator.
+export const MASTRA_AGENT_NAME_KEY = Symbol("agent.mastra");
 // Marks "an ADK turn span is already open in this trace tree" so nested
 // Runner wrappers (e.g. Runner.runEphemeral → Runner.runAsync internally, or
 // AgentTool's inner Runner) skip creating a duplicate agentic.turn span.

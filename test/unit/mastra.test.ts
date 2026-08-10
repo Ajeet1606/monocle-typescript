@@ -8,7 +8,11 @@ import { MASTRA_TURN_SPAN_ACTIVE_KEY } from '../../src/instrumentation/common/co
 import { getScopeFromContext } from '../../src/instrumentation/common/utils';
 import { config as mastraConfig } from '../../src/instrumentation/metamodel/mastra/methods';
 import { TOOL } from '../../src/instrumentation/metamodel/mastra/entities/tool';
+import { AGENT_INVOCATION } from '../../src/instrumentation/metamodel/mastra/entities/agentInvocation';
+import { MastraInvocationSpanHandler } from '../../src/instrumentation/metamodel/mastra/mastraProcessor';
+import { FROM_AGENT_KEY, FROM_AGENT_SPAN_ID_KEY, MASTRA_AGENT_NAME_KEY } from '../../src/instrumentation/common/constants';
 import { mastraToolWrapper } from '../../src/instrumentation/metamodel/mastra/mastraProcessor';
+import { getPatchedMainList } from '../../src/instrumentation/common/wrapper';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { trace } from '@opentelemetry/api';
@@ -134,9 +138,11 @@ describe('MastraTurnSpanHandler', () => {
 
 describe('Mastra methods config', () => {
     it('wraps Agent.generate and Agent.stream on @mastra/core/agent as turn spans', () => {
-        const byMethod = Object.fromEntries(mastraConfig.map((c: any) => [c.method, c]));
         for (const method of ['generate', 'stream']) {
-            const entry = byMethod[method];
+            // Each method now has a turn AND an invocation entry; select the turn.
+            const entry: any = mastraConfig.find(
+                (c: any) => c.method === method && c.output_processor?.[0]?.type === 'agentic.turn',
+            );
             expect(entry).toBeDefined();
             expect(entry.package).toBe('@mastra/core/agent');
             expect(entry.object).toBe('Agent');
@@ -569,6 +575,219 @@ describe('Mastra tool config entry', () => {
 
     it('leaves the existing turn and inference entries intact', () => {
         const methods = mastraConfig.map((c: any) => c.method).sort();
-        expect(methods).toEqual(['convertTools', 'doGenerate', 'doStream', 'generate', 'stream']);
+        // generate/stream appear twice each: one turn entry, one invocation entry.
+        expect(methods).toEqual([
+            'convertTools', 'doGenerate', 'doStream', 'generate', 'generate', 'stream', 'stream',
+        ]);
+    });
+});
+
+describe('Mastra AGENT_INVOCATION schema', () => {
+    // Delegation accessors read context.active(), so a real context manager is
+    // required — without one context.with() is a no-op.
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    it('declares the agentic.invocation type', () => {
+        expect(AGENT_INVOCATION.type).toBe(SPAN_TYPES.AGENTIC_INVOCATION);
+        expect(AGENT_INVOCATION.subtype).toBe(SPAN_SUBTYPES.CONTENT_PROCESSING);
+    });
+
+    it('reads agent identity from the Agent instance', () => {
+        expect(attrAccessor(AGENT_INVOCATION, 'type')({})).toBe('agent.mastra');
+        expect(attrAccessor(AGENT_INVOCATION, 'name')({ instance: { name: 'Weather Agent' } }))
+            .toBe('Weather Agent');
+        expect(attrAccessor(AGENT_INVOCATION, 'description')({
+            instance: { getDescription: () => 'Answers weather questions' },
+        })).toBe('Answers weather questions');
+    });
+
+    it('omits delegation attributes on a top-level invocation', () => {
+        context.with(ROOT_CONTEXT, () => {
+            expect(attrAccessor(AGENT_INVOCATION, 'from_agent')({})).toBeUndefined();
+            expect(attrAccessor(AGENT_INVOCATION, 'from_agent_span_id')({})).toBeUndefined();
+        });
+    });
+
+    it('emits delegation attributes when a parent agent handed off', () => {
+        const ctx = ROOT_CONTEXT
+            .setValue(FROM_AGENT_KEY, 'Weather Agent')
+            .setValue(FROM_AGENT_SPAN_ID_KEY, 'abc123');
+        context.with(ctx, () => {
+            expect(attrAccessor(AGENT_INVOCATION, 'from_agent')({})).toBe('Weather Agent');
+            expect(attrAccessor(AGENT_INVOCATION, 'from_agent_span_id')({})).toBe('abc123');
+        });
+    });
+
+    it('reuses the shared message normalizers for input and output', () => {
+        expect(eventAccessor(AGENT_INVOCATION, 'data.input', 'input')({ args: ['weather in Tokyo?'] }))
+            .toEqual([JSON.stringify({ user: 'weather in Tokyo?' })]);
+        expect(eventAccessor(AGENT_INVOCATION, 'data.output', 'response')({ response: { text: 'Sunny.' } }))
+            .toBe('Sunny.');
+        expect(eventAccessor(AGENT_INVOCATION, 'data.output', 'response')({ exception: new Error('boom') }))
+            .toContain('boom');
+    });
+});
+
+describe('MastraInvocationSpanHandler', () => {
+    const handler = new MastraInvocationSpanHandler();
+
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    // Only same-agent re-entry is skipped; a nested sub-agent still gets a span.
+    it('never skips, even inside an active turn', () => {
+        const call = () =>
+            handler.skipSpan({ instance: {}, args: [] as any, element: {} as any });
+        expect(call()).toBe(false);
+        context.with(ROOT_CONTEXT.setValue(MASTRA_TURN_SPAN_ACTIVE_KEY, true), () => {
+            expect(call()).toBe(false);
+        });
+    });
+
+    it('claims itself as the active agent for descendants', () => {
+        const ctx = handler.preTracing({} as any, ROOT_CONTEXT, { name: 'Weather Agent' }, []);
+        expect(ctx.getValue(MASTRA_AGENT_NAME_KEY)).toBe('Weather Agent');
+    });
+
+    it('generates a fresh agentic.invocation scope per activation', () => {
+        const ctx = handler.preTracing({} as any, ROOT_CONTEXT, { name: 'Weather Agent' }, []);
+        expect(getScopeFromContext(ctx, 'agentic.invocation')).toBeTruthy();
+    });
+
+    it('stamps from_agent when a different agent was already active', () => {
+        const parent = ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Weather Agent');
+        const ctx = handler.preTracing({} as any, parent, { name: 'Sub Agent' }, []);
+        expect(ctx.getValue(FROM_AGENT_KEY)).toBe('Weather Agent');
+        expect(ctx.getValue(MASTRA_AGENT_NAME_KEY)).toBe('Sub Agent');
+    });
+
+    it('does not stamp from_agent when the same agent re-enters', () => {
+        const parent = ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Weather Agent');
+        const ctx = handler.preTracing({} as any, parent, { name: 'Weather Agent' }, []);
+        expect(ctx.getValue(FROM_AGENT_KEY)).toBeUndefined();
+    });
+});
+
+describe('Mastra invocation config entries', () => {
+    it('adds an invocation entry for both generate and stream', () => {
+        for (const method of ['generate', 'stream']) {
+            const entries = mastraConfig.filter((c: any) => c.method === method && c.object === 'Agent');
+            expect(entries).toHaveLength(2);
+            const types = entries.map((e: any) => e.output_processor[0].type);
+            expect(types).toEqual(['agentic.turn', 'agentic.invocation']);
+        }
+    });
+
+    // Element 0 nests outside element 1, so the turn entry must come first.
+    it('orders the turn entry before the invocation entry', () => {
+        const idx = (t: string) =>
+            mastraConfig.findIndex((c: any) => c.method === 'generate' && c.output_processor?.[0]?.type === t);
+        expect(idx('agentic.turn')).toBeLessThan(idx('agentic.invocation'));
+    });
+});
+
+// Exercises the real grouping machinery, not the config shape.
+describe('turn + invocation nesting (real spans)', () => {
+    let provider: NodeTracerProvider;
+    let memExporter: InMemorySpanExporter;
+    let tracer: any;
+
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    beforeEach(() => {
+        memExporter = new InMemorySpanExporter();
+        provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(memExporter)] });
+        tracer = provider.getTracer('test');
+    });
+
+    afterEach(async () => { await provider.shutdown(); });
+
+    // Mirrors what _getOnPatchMain does for a multi-element group. The patched
+    // function forwards via `arguments`, so it infers as `() => any`; the return
+    // type here reflects what it actually accepts.
+    function patchGenerate(agent: any, impl: Function): (...args: any[]) => Promise<any> {
+        const elements = mastraConfig
+            .filter((c: any) => c.method === 'generate' && c.object === 'Agent')
+            .map((c: any) => ({ ...c, tracer }));
+        return getPatchedMainList(elements as any)(impl).bind(agent) as (...args: any[]) => Promise<any>;
+    }
+
+    it('emits a turn span wrapping an invocation span for a top-level call', async () => {
+        const agent = { name: 'Weather Agent', id: 'weather-agent' };
+        const generate = patchGenerate(agent, async () => ({ text: 'Sunny.' }));
+
+        await generate('weather in Tokyo?');
+
+        const spans = memExporter.getFinishedSpans();
+        const turn = spans.find((s: any) => s.attributes['span.type'] === 'agentic.turn');
+        const invoke = spans.find((s: any) => s.attributes['span.type'] === 'agentic.invocation');
+        if (!turn || !invoke) throw new Error('expected both a turn and an invocation span');
+
+        expect(turn.name).toBe('mastra.agent.generate');
+        expect(invoke.name).toBe('mastra.agent.invoke');
+        // Invocation nests inside the turn.
+        expect((invoke as any).parentSpanContext?.spanId ?? (invoke as any).parentSpanId)
+            .toBe(turn.spanContext().spanId);
+        expect(invoke.attributes['entity.1.name']).toBe('Weather Agent');
+    });
+
+    // Inside an active turn the turn span is suppressed, but the invocation
+    // span must still open — the gap this feature fills.
+    it('emits only an invocation span for a nested agent call', async () => {
+        const sub = { name: 'Sub Agent', id: 'sub-agent' };
+        const generate = patchGenerate(sub, async () => ({ text: 'delegated answer' }));
+
+        const parentCtx = ROOT_CONTEXT
+            .setValue(MASTRA_TURN_SPAN_ACTIVE_KEY, true)
+            .setValue(MASTRA_AGENT_NAME_KEY, 'Weather Agent');
+        await context.with(parentCtx, () => generate('sub task'));
+
+        const spans = memExporter.getFinishedSpans();
+        expect(spans.filter((s: any) => s.attributes['span.type'] === 'agentic.turn')).toHaveLength(0);
+
+        const invoke = spans.find((s: any) => s.attributes['span.type'] === 'agentic.invocation');
+        if (!invoke) throw new Error('expected an invocation span for the nested agent');
+        expect(invoke.attributes['entity.1.name']).toBe('Sub Agent');
+        // Delegation is recorded against the agent that was already active.
+        expect(invoke.attributes['entity.1.from_agent']).toBe('Weather Agent');
+    });
+});
+
+describe('MastraInvocationSpanHandler re-entry', () => {
+    const handler = new MastraInvocationSpanHandler();
+    const skip = (instance: any) =>
+        handler.skipSpan({ instance, args: [] as any, element: {} as any });
+
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    // Mastra re-enters its own methods within one activation, which was emitting
+    // two identical invocation spans.
+    it('skips when the same agent is already active', () => {
+        context.with(ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Supervisor Agent'), () => {
+            expect(skip({ name: 'Supervisor Agent' })).toBe(true);
+        });
+    });
+
+    it('does not skip a genuinely different agent', () => {
+        context.with(ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Supervisor Agent'), () => {
+            expect(skip({ name: 'Weather Agent' })).toBe(false);
+        });
+    });
+
+    it('does not skip at the top level', () => {
+        context.with(ROOT_CONTEXT, () => {
+            expect(skip({ name: 'Supervisor Agent' })).toBe(false);
+        });
+    });
+
+    // Two separate activations: the supervisor is active again between them.
+    it('does not skip a repeat delegation to the same sub-agent', () => {
+        context.with(ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Supervisor Agent'), () => {
+            expect(skip({ name: 'Weather Agent' })).toBe(false);
+            expect(skip({ name: 'Weather Agent' })).toBe(false);
+        });
     });
 });

@@ -1,8 +1,9 @@
 import { MethodConfig } from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
 import { AGENT_REQUEST } from "./entities/agentRequest";
+import { AGENT_INVOCATION } from "./entities/agentInvocation";
 import { INFERENCE, INFERENCE_STREAM } from "./entities/inference";
-import { MastraTurnSpanHandler, mastraToolWrapper } from "./mastraProcessor";
+import { MastraInvocationSpanHandler, MastraTurnSpanHandler, mastraToolWrapper } from "./mastraProcessor";
 
 // Agent.generate() (one-shot) and Agent.stream() (streaming) are exported
 // prototype methods on the singleton Agent class; @mastra/core/agent is the
@@ -34,6 +35,25 @@ export const config: MethodConfig[] = [
         spanName: "mastra.agent.stream",
         spanHandler: new MastraTurnSpanHandler(),
         output_processor: [AGENT_REQUEST],
+    } as unknown as MethodConfig,
+    // Same package/object/method as the turn entries above, so each pair is
+    // merged into one nested chain: turn outside, invocation inside. Must stay
+    // after the turn entries — order decides the nesting.
+    {
+        package: MASTRA_AGENT_PACKAGE,
+        object: "Agent",
+        method: "generate",
+        spanName: "mastra.agent.invoke",
+        spanHandler: new MastraInvocationSpanHandler(),
+        output_processor: [AGENT_INVOCATION],
+    } as unknown as MethodConfig,
+    {
+        package: MASTRA_AGENT_PACKAGE,
+        object: "Agent",
+        method: "stream",
+        spanName: "mastra.agent.invoke",
+        spanHandler: new MastraInvocationSpanHandler(),
+        output_processor: [AGENT_INVOCATION],
     } as unknown as MethodConfig,
     {
         // DefaultSpanHandler: used when the span is not part of a larger agentic turn (e.g. when the LLM is called directly, outside of an agentic loop). This ensures that the span is still created and processed correctly, even if it is not part of a larger agentic turn.
