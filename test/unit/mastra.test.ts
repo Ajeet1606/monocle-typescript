@@ -610,12 +610,11 @@ describe('Mastra AGENT_INVOCATION schema', () => {
     });
 
     it('emits delegation attributes when a parent agent handed off', () => {
-        const ctx = ROOT_CONTEXT
-            .setValue(FROM_AGENT_KEY, 'Weather Agent')
-            .setValue(FROM_AGENT_SPAN_ID_KEY, 'abc123');
-        context.with(ctx, () => {
+        // from_agent comes off the context; the span id comes from the parent span.
+        const parentSpan = { spanContext: () => ({ spanId: 'abc123' }) };
+        context.with(ROOT_CONTEXT.setValue(FROM_AGENT_KEY, 'Weather Agent'), () => {
             expect(attrAccessor(AGENT_INVOCATION, 'from_agent')({})).toBe('Weather Agent');
-            expect(attrAccessor(AGENT_INVOCATION, 'from_agent_span_id')({})).toBe('abc123');
+            expect(attrAccessor(AGENT_INVOCATION, 'from_agent_span_id')({ parentSpan })).toBe('abc123');
         });
     });
 
@@ -788,6 +787,118 @@ describe('MastraInvocationSpanHandler re-entry', () => {
         context.with(ROOT_CONTEXT.setValue(MASTRA_AGENT_NAME_KEY, 'Supervisor Agent'), () => {
             expect(skip({ name: 'Weather Agent' })).toBe(false);
             expect(skip({ name: 'Weather Agent' })).toBe(false);
+        });
+    });
+});
+
+describe('mastraToolWrapper — agent-delegation tools', () => {
+    let provider: NodeTracerProvider;
+    let memExporter: InMemorySpanExporter;
+    let tracer: any;
+    const toolElement: any = { package: '@mastra/core/agent', object: 'Agent', method: 'convertTools' };
+
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    beforeEach(() => {
+        memExporter = new InMemorySpanExporter();
+        provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(memExporter)] });
+        tracer = provider.getTracer('test');
+    });
+    afterEach(async () => { await provider.shutdown(); });
+
+    // Mastra exposes each sub-agent as an `agent-<key>` tool, so delegation shows
+    // up as a tool call. That span sits between the delegating agent's invocation
+    // and the sub-agent's, which is Mastra plumbing rather than anything the user
+    // wrote — skip it so the sub-agent parents straight to its delegator.
+    const supervisor = {
+        name: 'Supervisor Agent',
+        id: 'supervisor-agent',
+        listAgents: () => ({ weatherAgent: {}, excuseGeneratorAgent: {} }),
+    };
+
+    it('leaves delegation tools unwrapped', async () => {
+        const tools: any = {
+            'agent-weatherAgent': { id: 'agent-weatherAgent', execute: async () => 'delegated' },
+            'get-weather': { id: 'get-weather', execute: async () => 'sunny' },
+        };
+        const originalDelegate = tools['agent-weatherAgent'].execute;
+
+        const out: any = await mastraToolWrapper(
+            tracer, undefined, toolElement, async () => tools, supervisor, '', [{}],
+        );
+
+        expect(out['agent-weatherAgent'].execute).toBe(originalDelegate); // untouched
+        expect(out['get-weather'].execute).not.toBe(undefined);
+    });
+
+    it('emits no span when a delegation tool runs, but still does for a real tool', async () => {
+        const tools: any = {
+            'agent-weatherAgent': { id: 'agent-weatherAgent', execute: async () => 'delegated' },
+            'get-weather': { id: 'get-weather', execute: async () => 'sunny' },
+        };
+        const out: any = await mastraToolWrapper(
+            tracer, undefined, toolElement, async () => tools, supervisor, '', [{}],
+        );
+
+        await out['agent-weatherAgent'].execute({});
+        expect(memExporter.getFinishedSpans().filter((s: any) => s.name === 'mastra.tool')).toHaveLength(0);
+
+        await out['get-weather'].execute({ location: 'Tokyo' });
+        const toolSpans = memExporter.getFinishedSpans().filter((s: any) => s.name === 'mastra.tool');
+        expect(toolSpans).toHaveLength(1);
+        expect(toolSpans[0].attributes['entity.1.name']).toBe('get-weather');
+    });
+
+    it('still wraps everything when the agent has no sub-agents', async () => {
+        const plain = { name: 'Weather Agent', id: 'weather-agent', listAgents: () => ({}) };
+        const tools: any = { 'get-weather': { id: 'get-weather', execute: async () => 'sunny' } };
+        const original = tools['get-weather'].execute;
+
+        const out: any = await mastraToolWrapper(
+            tracer, undefined, toolElement, async () => tools, plain, '', [{}],
+        );
+        expect(out['get-weather'].execute).not.toBe(original);
+    });
+
+    // listAgents is Mastra API surface; a version without it must not break tracing.
+    it('falls back to wrapping everything if listAgents is unavailable', async () => {
+        const odd = { name: 'Odd Agent', id: 'odd' };
+        const tools: any = { 'get-weather': { id: 'get-weather', execute: async () => 'sunny' } };
+        const original = tools['get-weather'].execute;
+
+        const out: any = await mastraToolWrapper(
+            tracer, undefined, toolElement, async () => tools, odd, '', [{}],
+        );
+        expect(out['get-weather'].execute).not.toBe(original);
+    });
+});
+
+describe('AGENT_INVOCATION from_agent_span_id', () => {
+    beforeAll(() => { context.setGlobalContextManager(new AsyncHooksContextManager().enable()); });
+    afterAll(() => { context.disable(); });
+
+    const spanId = (id: string) => ({ spanContext: () => ({ spanId: id }) });
+    const acc = () => attrAccessor(AGENT_INVOCATION, 'from_agent_span_id');
+
+    // With the delegation tool span skipped, the parent of a sub-agent's
+    // invocation is its delegator's invocation — same shape as ADK.
+    it('reports the delegating agent span when a delegation happened', () => {
+        context.with(ROOT_CONTEXT.setValue(FROM_AGENT_KEY, 'Supervisor Agent'), () => {
+            expect(acc()({ parentSpan: spanId('f6aa6253da3d9285') })).toBe('f6aa6253da3d9285');
+        });
+    });
+
+    it('stays empty on a top-level invocation', () => {
+        context.with(ROOT_CONTEXT, () => {
+            expect(acc()({ parentSpan: spanId('f6aa6253da3d9285') })).toBeUndefined();
+        });
+    });
+
+    it('stays empty when no parent span is available', () => {
+        context.with(ROOT_CONTEXT.setValue(FROM_AGENT_KEY, 'Supervisor Agent'), () => {
+            expect(acc()({})).toBeUndefined();
+            expect(acc()({ parentSpan: {} })).toBeUndefined();
         });
     });
 });

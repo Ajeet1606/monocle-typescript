@@ -1,7 +1,6 @@
 import { context } from "@opentelemetry/api";
 import {
     FROM_AGENT_KEY,
-    FROM_AGENT_SPAN_ID_KEY,
     SPAN_SUBTYPES,
     SPAN_TYPES,
 } from "../../../common/constants";
@@ -14,9 +13,6 @@ function readFromAgent(): string | undefined {
     return context.active().getValue(FROM_AGENT_KEY) as string | undefined;
 }
 
-function readFromAgentSpanId(): string | undefined {
-    return context.active().getValue(FROM_AGENT_SPAN_ID_KEY) as string | undefined;
-}
 
 // One agent activation. The turn span covers the whole user request; this covers
 // one agent's run within it, so a delegated sub-agent gets its own.
@@ -57,11 +53,14 @@ export const AGENT_INVOCATION = {
                 },
             },
             {
+                // The delegation tool span is skipped (see delegationToolKeys), so a
+                // sub-agent's parent is its delegator's invocation span — the same
+                // shape ADK produces.
                 "_comment": "span_id of the delegating agent's invocation",
                 "attribute": "from_agent_span_id",
-                "accessor": function () {
+                "accessor": function ({ parentSpan }: any) {
                     if (!readFromAgent()) return undefined;
-                    return readFromAgentSpanId();
+                    return parentSpan?.spanContext?.()?.spanId;
                 },
             },
         ],

@@ -122,6 +122,26 @@ export class MastraInvocationSpanHandler extends DefaultSpanHandler {
 
 const MONOCLE_WRAPPED = "_monocleWrapped";
 
+// Mastra exposes each sub-agent as an `agent-<key>` tool (see listAgentTools in
+// @mastra/core src/agent/agent.ts), so delegation surfaces as a tool call. That
+// span is Mastra plumbing sitting between the delegating agent's invocation and
+// the sub-agent's, so we skip it — the sub-agent then parents straight to its
+// delegator, matching how ADK nests delegated agents.
+//
+// Keys come from listAgents() rather than an "agent-" prefix test, so a
+// user-defined tool that happens to start with "agent-" is still traced.
+function delegationToolKeys(agent: any): Set<string> {
+    try {
+        const subAgents = typeof agent?.listAgents === "function" ? agent.listAgents({}) : null;
+        if (!subAgents || typeof subAgents !== "object" || typeof subAgents.then === "function") {
+            return new Set();
+        }
+        return new Set(Object.keys(subAgents).map((k) => `agent-${k}`));
+    } catch {
+        return new Set(); // never let tracing break tool setup
+    }
+}
+
 // Wraps each tool's execute in the map Agent.convertTools returns, since Mastra
 // tools expose no prototype method to patch. Mutating the map is safe: Mastra's
 // wrapToolWithHooks hands back `{...tool, execute}`, a fresh copy per call.
@@ -141,8 +161,10 @@ export function mastraToolWrapper(
         if (!tools || typeof tools !== "object") return tools;
 
         const agentStamp = { name: instance?.name || "", id: instance?.id || "" };
+        const delegationTools = delegationToolKeys(instance);
 
         for (const toolName of Object.keys(tools)) {
+            if (delegationTools.has(toolName)) continue;
             const tool = tools[toolName];
             const originalExecute = tool?.execute;
             if (typeof originalExecute !== "function") continue;
