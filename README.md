@@ -44,48 +44,98 @@ npm install --save monocle2ai
 
 Monocle instruments GenAI libraries (OpenAI, LangChain, LlamaIndex, Mastra, …) by
 hooking them **at module load**, so Monocle must be set up **before your app imports
-those libraries**. How you arrange that depends on your runtime.
+those libraries**. One preload does this for both ESM and CommonJS; Next.js and
+`mastra dev` supply it their own way.
 
-### CommonJS (CJS) apps
+### Node / tsx scripts (ESM and CommonJS)
 
-The classic setup still works for CommonJS apps — call `setupMonocle` at the top of
-your entry file, before requiring the instrumented libraries:
-
-```js
-const { setupMonocle } = require("monocle2ai");
-setupMonocle("your-app-name");
-
-const OpenAI = require("openai"); // required AFTER setupMonocle → hooked
-```
-
-`require` runs synchronously in order, so a top-of-file `setupMonocle` registers the
-hooks (via require-in-the-middle) before the libraries load — no preload flag needed.
-The ESM ordering caveat below does **not** apply to CommonJS.
-
-### Node / tsx scripts (ESM)
-
-Preload the built-in register entry — no instrumentation file to write:
-
-```
-node --import monocle2ai/register app.js
-tsx  --import monocle2ai/register app.ts
-```
-
-Or set it once in `.env` and launch (Node reads `NODE_OPTIONS` at
-startup, so this preloads before your app graph loads):
+The same setup works for both module systems. Put the preload in `.env`:
 
 ```
 # .env
 NODE_OPTIONS=--import monocle2ai/register
 MONOCLE_WORKFLOW_NAME=my-app        # service name used by monocle2ai/register
-```
-```
-node app.js
+MONOCLE_EXPORTER=file
 ```
 
-A plain top-of-file `import` of your setup is **not** enough in ESM: the whole import
-graph loads before any code runs, so the instrumented libraries are already loaded by
-then. Use the preload above (or `mastra dev` / Next.js integration below).
+and pass `--env-file` when you launch, so Node reads it **at startup**:
+
+```jsonc
+// package.json
+"scripts": {
+  "start": "node --env-file=.env index.js",                 // CommonJS
+  "agent": "npx tsx --env-file=.env src/scripts/agent.ts"   // ESM / TypeScript
+}
+```
+
+Nothing goes in your application code — no `setupMonocle()` call, no instrumentation
+file. The preload registers hooks for **both** `import` (via import-in-the-middle) and
+`require` (via require-in-the-middle) before your app loads, so it covers ESM and CJS
+alike.
+
+Equivalent, if you would rather not use a `.env` file:
+
+```
+node --import monocle2ai/register index.js
+npx tsx --import monocle2ai/register src/scripts/agent.ts
+```
+
+**Requires Node 20.6+ (or 18.20+).** `--env-file` and `--import` were added in those
+releases; on older Node, export the variables in your shell instead.
+
+#### Things that look equivalent but are not
+
+- **`import "dotenv/config"` cannot replace `--env-file`.** dotenv runs inside your
+  program, long after Node has decided whether to preload anything, so `NODE_OPTIONS`
+  set that way is ignored — silently. Node must see the variable before it starts.
+  (dotenv is fine for variables read later, such as API keys.)
+- **`--require monocle2ai/register` is not a substitute for `--import`.** The CommonJS
+  build cannot register the ESM loader hook, so `--require` traces CJS only. `--import`
+  covers both.
+- **A top-of-file `import` of your own setup module is not enough in ESM.** The whole
+  import graph is resolved before any of your code runs, so the instrumented libraries
+  are already loaded by the time `setupMonocle()` executes.
+
+#### TypeScript files that use `import`, in a package without `"type": "module"`
+
+If `package.json` has no `"type"` field, Node decides CommonJS vs ESM **per file, from
+its syntax**. A `.ts` file containing any `import`/`export` is therefore treated as an
+ES module, goes through the ESM loader, and can fail to load with:
+
+```
+Error: 'import-in-the-middle' failed to wrap 'file:///.../your-file.ts'
+TypeError [ERR_INVALID_RETURN_PROPERTY_VALUE]: Expected string, array buffer, or typed
+array to be returned for the "source" from the "load" hook but got undefined
+```
+
+Nothing in that message points at Monocle, but it only appears once the preload is
+active. Either fix works:
+
+- add `"type": "module"` to `package.json` (preferred for a TypeScript project), or
+- keep the file pure CommonJS — `require()` only, no `import`/`export`. Note a lone
+  `export {};` is enough to flip the file to ESM.
+
+A `.ts` file that uses only `require()` loads as CommonJS and is instrumented normally.
+
+#### CommonJS without any flags
+
+CommonJS has one extra option, because `require` is lazy rather than hoisted: call
+`setupMonocle` yourself before requiring the instrumented libraries.
+
+```js
+require("dotenv/config");                 // load .env first, so MONOCLE_* are set
+const { setupMonocle } = require("monocle2ai");
+setupMonocle("your-app-name");
+
+const OpenAI = require("openai");         // required AFTER setupMonocle → hooked
+```
+
+Order matters twice: `dotenv` before `setupMonocle` (otherwise `MONOCLE_EXPORTER` is
+not set yet and traces fall back to the console), and `setupMonocle` before any
+instrumented `require`. Anything loaded earlier cannot be patched.
+
+This is not needed if you use the `--env-file` setup above, and the two are safe to
+combine — the preload will not double-instrument.
 
 ### Next.js
 
@@ -126,8 +176,10 @@ instrumentation hook is the preload):
 
 ### mastra dev
 
-`mastra dev` bundles your app and spawns a server process, forwarding `.env` to it.
-Set the preload in `.env` and it reaches the spawned process at startup:
+`mastra dev` bundles your app and spawns a server process, reading `.env` itself and
+forwarding it. Set the preload in `.env` and it reaches the spawned process at
+startup — no `--env-file` flag needed here, unlike a script you launch with
+`node`/`tsx` directly:
 
 ```
 # .env
