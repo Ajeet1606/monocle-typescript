@@ -23,7 +23,7 @@ import { getMonocleExporters } from '../../exporters';
 import { PatchedBatchSpanProcessor } from './opentelemetryUtils';
 import { AWSS3SpanExporter } from '../../exporters/aws/AWSS3SpanExporter'
 import { consoleLog } from '../../common/logging';
-import { setScopesInternal, getScopesInternal, setScopesBindInternal, load_scopes, setInstrumentor, startTraceInternal } from './utils';
+import { setScopesInternal, getScopesInternal, setScopesBindInternal, load_scopes, setInstrumentor, getInstrumentor, startTraceInternal } from './utils';
 
 class MonocleInstrumentation extends InstrumentationBase {
     // `declare` (no runtime field): a real field would emit `this.x = undefined`
@@ -376,8 +376,20 @@ const setupMonocle = (
 
     try {
         consoleLog(`Setting up Monocle for workflow: ${workflowName}`);
+
         if (spanProcessors.length && exporter_list) {
             throw new Error('Cannot set both spanProcessors and exporter_list.');
+        }
+
+        // Set up once per process: `monocle2ai run` preloads the register entry
+        // and the target file may call setupMonocle too, which would build a
+        // second tracer provider and export every span twice.
+        const existing = getInstrumentor();
+        if (existing) {
+            consoleLog(
+                `Monocle is already set up; ignoring this call for workflow: ${workflowName}`
+            );
+            return existing;
         }
         registerModule();
 
