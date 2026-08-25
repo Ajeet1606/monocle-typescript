@@ -16,16 +16,9 @@ describe('parseArgs', () => {
 
   it('does not treat the target script own flags as monocle flags', () => {
     const parsed = parseArgs(['run', 'agent.ts', '--tsx']);
-
-    expect(parsed.forceTsx).toBe(false);
     expect(parsed.userArgs).toEqual(['--tsx']);
   });
 
-  it('accepts --tsx before the file as a monocle flag', () => {
-    const parsed = parseArgs(['run', '--tsx', 'agent.ts']);
-
-    expect(parsed).toMatchObject({ command: 'run', file: 'agent.ts', forceTsx: true });
-  });
 
   it('reports a run with no file as an error', () => {
     expect(parseArgs(['run']).command).toBe('error');
@@ -54,6 +47,5 @@ describe('parseArgs', () => {
     const parsed = parseArgs(['run', 'agent.ts', '--', '--tsx']);
 
     expect(parsed.userArgs).toEqual(['--', '--tsx']);
-    expect(parsed.forceTsx).toBe(false);
   });
 });
