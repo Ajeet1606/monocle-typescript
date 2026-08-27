@@ -15,7 +15,7 @@ ${USAGE}
 Tracing is preloaded before your code runs, so the target file needs no edits.
 Set MONOCLE_WORKFLOW_NAME to name the workflow (defaults to the package name).`;
 
-interface RunOutcome {
+export interface RunOutcome {
     code: number;
     /** Set when the runner itself could not be started, as opposed to failing. */
     spawnError?: string;
@@ -24,21 +24,34 @@ interface RunOutcome {
 /**
  * Run the target. All three streams are inherited so the script stays fully
  * interactive and its output is never buffered or reordered.
+ *
+ * Node emits only EACCES, EAGAIN, EMFILE, ENFILE and ENOENT as 'error' events
+ * and throws every other spawn failure, so the call is guarded: an unguarded
+ * throw escapes this executor and reaches the user as a raw Node stack.
  */
-function runOnce(plan: RunPlan): Promise<RunOutcome> {
+export function runOnce(
+    plan: RunPlan,
+    execPath: string = process.execPath
+): Promise<RunOutcome> {
     return new Promise((resolve) => {
-        const command = resolveRunnerCommand(plan.cwd);
-        if (command.bin === "npx") {
+        const command = resolveRunnerCommand(plan.cwd, execPath);
+        if (command.usedNpx) {
             console.error(
                 "[monocle] tsx is not installed here; running it through npx. " +
                 "Your project is left untouched."
             );
         }
-        const child = spawn(command.bin, [...command.prefixArgs, ...plan.args], {
-            cwd: plan.cwd,
-            stdio: "inherit",
-            env: process.env,
-        });
+        let child;
+        try {
+            child = spawn(command.bin, [...command.prefixArgs, ...plan.args], {
+                cwd: plan.cwd,
+                stdio: "inherit",
+                env: process.env,
+            });
+        } catch (err) {
+            resolve({ code: 1, spawnError: (err as Error).message });
+            return;
+        }
 
         child.on("error", (err) => resolve({ code: 1, spawnError: err.message }));
         child.on("close", (code) => resolve({ code: code ?? 1 }));

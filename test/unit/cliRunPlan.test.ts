@@ -6,7 +6,8 @@ import {
   preloadFlagFor,
   projectDirFor,
   buildRunPlan,
-  findLocalBin,
+  findTsxEntry,
+  findNpxCli,
   resolveRunnerCommand,
 } from '../../src/cli/runPlan';
 
@@ -137,46 +138,129 @@ describe('buildRunPlan', () => {
   });
 });
 
-describe('findLocalBin', () => {
-  it('finds a binary in the starting directory', () => {
-    const bin = write('node_modules/.bin/tsx', '#!/bin/sh');
+const installTsx = (bin: unknown = './dist/cli.mjs') => {
+  write(`node_modules/tsx/package.json`, JSON.stringify({ name: 'tsx', bin }));
+  return write(`node_modules/tsx/dist/cli.mjs`, '// tsx');
+};
 
-    expect(findLocalBin('tsx', root)).toBe(bin);
+describe('findTsxEntry', () => {
+  it('resolves the JS entry point of the installed tsx package', () => {
+    const entry = installTsx();
+
+    expect(findTsxEntry(root)).toBe(entry);
   });
 
-  it('walks up to a hoisted binary, as module resolution does', () => {
-    const bin = write('node_modules/.bin/tsx', '#!/bin/sh');
+  // node_modules/.bin holds shell shims, and Windows ships tsx.cmd there.
+  // Node refuses to spawn a .cmd without a shell, so the entry must be a plain
+  // JS file we can hand to the node binary ourselves.
+  it('never returns a shim from node_modules/.bin', () => {
+    installTsx();
+    write('node_modules/.bin/tsx.cmd', '@echo off');
+    write('node_modules/.bin/tsx', '#!/bin/sh');
+
+    expect(findTsxEntry(root)).toMatch(/dist[\\/]cli\.mjs$/);
+  });
+
+  it('walks up to a hoisted tsx, as module resolution does', () => {
+    const entry = installTsx();
     const nested = path.join(root, 'packages/api');
     fs.mkdirSync(nested, { recursive: true });
 
-    expect(findLocalBin('tsx', nested)).toBe(bin);
+    expect(findTsxEntry(nested)).toBe(entry);
   });
 
-  it('returns undefined when the binary is nowhere up the tree', () => {
-    expect(findLocalBin('tsx', root)).toBeUndefined();
+  it('reads the object form of the bin field', () => {
+    const entry = installTsx({ tsx: './dist/cli.mjs' });
+
+    expect(findTsxEntry(root)).toBe(entry);
+  });
+
+  it('returns undefined when tsx is nowhere up the tree', () => {
+    expect(findTsxEntry(root)).toBeUndefined();
+  });
+
+  it('returns undefined when the manifest points at a file that is not there', () => {
+    write('node_modules/tsx/package.json', JSON.stringify({ bin: './dist/cli.mjs' }));
+
+    expect(findTsxEntry(root)).toBeUndefined();
+  });
+
+  it('returns undefined when the manifest cannot be parsed', () => {
+    write('node_modules/tsx/package.json', 'not json');
+
+    expect(findTsxEntry(root)).toBeUndefined();
+  });
+});
+
+describe('findNpxCli', () => {
+  it('finds npx-cli.js beside the node binary, the layout Windows installs use', () => {
+    const cli = write('nodedir/node_modules/npm/bin/npx-cli.js', '// npx');
+
+    expect(findNpxCli(path.join(root, 'nodedir/node.exe'))).toBe(cli);
+  });
+
+  it('finds npx-cli.js under lib, the layout POSIX installs use', () => {
+    const cli = write('lib/node_modules/npm/bin/npx-cli.js', '// npx');
+
+    expect(findNpxCli(path.join(root, 'bin/node'))).toBe(cli);
+  });
+
+  it('returns undefined when npm is not installed beside node', () => {
+    expect(findNpxCli(path.join(root, 'bin/node'))).toBeUndefined();
   });
 });
 
 describe('resolveRunnerCommand', () => {
-  it('prefers a tsx installed in the project', () => {
-    const bin = write('node_modules/.bin/tsx', '#!/bin/sh');
+  const posix = '/usr/bin/node';
+  const win = 'C:\\nodejs\\node.exe';
 
-    expect(resolveRunnerCommand(root)).toEqual({ bin, prefixArgs: [] });
+  it('runs the tsx entry through the node binary already running', () => {
+    const entry = installTsx();
+
+    expect(resolveRunnerCommand(root, posix)).toEqual({
+      bin: posix,
+      prefixArgs: [entry],
+      usedNpx: false,
+    });
   });
 
-  // npx resolves tsx from a user-level cache (~/.npm/_npx) and leaves
-  // package.json, the lockfile and node_modules untouched — verified.
-  it('falls back to npx when tsx is not installed, rather than refusing to run', () => {
-    expect(resolveRunnerCommand(root)).toEqual({
+  // The reported bug: Node >= 18.20.2 returns EINVAL rather than spawning a
+  // .cmd without a shell, and EINVAL is thrown rather than emitted.
+  it('spawns no .cmd shim on Windows when tsx is installed', () => {
+    installTsx();
+    write('node_modules/.bin/tsx.cmd', '@echo off');
+
+    const command = resolveRunnerCommand(root, win);
+
+    expect(command.bin).toBe(win);
+    expect([command.bin, ...command.prefixArgs].join(' ')).not.toMatch(/\.(cmd|bat)$/im);
+  });
+
+  it("falls back to npm's own npx-cli.js through node, which needs no shell", () => {
+    const cli = write('nodedir/node_modules/npm/bin/npx-cli.js', '// npx');
+    const execPath = path.join(root, 'nodedir/node.exe');
+
+    expect(resolveRunnerCommand(root, execPath)).toEqual({
+      bin: execPath,
+      prefixArgs: [cli, '--yes', 'tsx'],
+      usedNpx: true,
+    });
+  });
+
+  // Last resort: npx is on PATH as a shell script on POSIX, so this still works
+  // there; on Windows it fails, and the CLI turns that into install guidance.
+  it('falls back to the npx command when npm cannot be located beside node', () => {
+    expect(resolveRunnerCommand(root, posix)).toEqual({
       bin: 'npx',
       prefixArgs: ['--yes', 'tsx'],
+      usedNpx: true,
     });
   });
 
   it('reports whether the fallback is in use so the CLI can say so', () => {
-    expect(resolveRunnerCommand(root).bin).toBe('npx');
+    expect(resolveRunnerCommand(root, posix).usedNpx).toBe(true);
 
-    write('node_modules/.bin/tsx', '#!/bin/sh');
-    expect(resolveRunnerCommand(root).bin).not.toBe('npx');
+    installTsx();
+    expect(resolveRunnerCommand(root, posix).usedNpx).toBe(false);
   });
 });

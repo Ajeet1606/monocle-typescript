@@ -40,17 +40,17 @@ export function projectDirFor(filePath: string): string {
 }
 
 /**
- * Locate an executable installed by npm, walking up from `startDir` the way
- * module resolution does — package managers hoist binaries to the workspace
- * root, so a nested package's own directory often will not hold them.
+ * Locate tsx's own JS entry point, walking up from `startDir` the way module
+ * resolution does — package managers hoist dependencies to the workspace root.
+ * We resolve the package rather than node_modules/.bin deliberately: those are
+ * shell shims, and Windows ships tsx.cmd, which Node refuses to spawn.
  */
-export function findLocalBin(name: string, startDir: string): string | undefined {
-    const binName = process.platform === "win32" ? `${name}.cmd` : name;
+export function findTsxEntry(startDir: string): string | undefined {
     let dir = path.resolve(startDir);
     for (;;) {
-        const candidate = path.join(dir, "node_modules", ".bin", binName);
-        if (fs.existsSync(candidate)) {
-            return candidate;
+        const entry = binEntryOf(path.join(dir, "node_modules", "tsx"));
+        if (entry) {
+            return entry;
         }
         const parent = path.dirname(dir);
         if (parent === dir) {
@@ -60,23 +60,75 @@ export function findLocalBin(name: string, startDir: string): string | undefined
     }
 }
 
-export interface RunnerCommand {
-    /** Executable to spawn. */
-    bin: string;
-    /** Arguments that must precede the run arguments (used by the npx fallback). */
-    prefixArgs: string[];
+/** Resolve a package's `bin` field to an existing file, in either declared form. */
+function binEntryOf(pkgDir: string): string | undefined {
+    let bin: unknown;
+    try {
+        bin = JSON.parse(
+            fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")
+        ).bin;
+    } catch {
+        return undefined;
+    }
+    const rel =
+        typeof bin === "string"
+            ? bin
+            : bin && typeof bin === "object"
+              ? Object.values(bin as Record<string, string>)[0]
+              : undefined;
+    if (typeof rel !== "string") {
+        return undefined;
+    }
+    const entry = path.join(pkgDir, rel);
+    return fs.existsSync(entry) ? entry : undefined;
 }
 
 /**
- * Resolve how to invoke tsx. When it is not installed we fall back to
- * `npx --yes tsx` rather than refusing: npx serves it from a user-level cache
- * and leaves package.json, the lockfile and node_modules untouched.
+ * Find the npx script npm ships, so the fallback can run through node too.
+ * Windows keeps npm beside the binary and POSIX keeps it under ../lib, and
+ * every mainstream installer and version manager uses one of the two.
  */
-export function resolveRunnerCommand(cwd: string): RunnerCommand {
-    const local = findLocalBin("tsx", cwd);
-    return local
-        ? { bin: local, prefixArgs: [] }
-        : { bin: "npx", prefixArgs: ["--yes", "tsx"] };
+export function findNpxCli(execPath: string = process.execPath): string | undefined {
+    const dir = path.dirname(execPath);
+    return [
+        path.join(dir, "node_modules", "npm", "bin", "npx-cli.js"),
+        path.join(dir, "..", "lib", "node_modules", "npm", "bin", "npx-cli.js"),
+    ].find((candidate) => fs.existsSync(candidate));
+}
+
+export interface RunnerCommand {
+    /** Executable to spawn. */
+    bin: string;
+    /** Arguments that must precede the run arguments. */
+    prefixArgs: string[];
+    /** Whether tsx is being fetched on the fly rather than run from the project. */
+    usedNpx: boolean;
+}
+
+/**
+ * Resolve how to invoke tsx, through the running node binary so that no shell
+ * shim is spawned: Node returns EINVAL rather than executing a .cmd or .bat
+ * without a shell, which is how this failed on Windows. The result no longer
+ * varies by platform.
+ *
+ * When tsx is not installed we fetch it with npx rather than refusing — that
+ * serves it from a user-level cache and leaves package.json, the lockfile and
+ * node_modules untouched. Bare "npx" is the last resort, for the rare layout
+ * where npm is not beside node; it works on POSIX, and on Windows the CLI
+ * turns the resulting failure into install guidance.
+ */
+export function resolveRunnerCommand(
+    cwd: string,
+    execPath: string = process.execPath
+): RunnerCommand {
+    const tsx = findTsxEntry(cwd);
+    if (tsx) {
+        return { bin: execPath, prefixArgs: [tsx], usedNpx: false };
+    }
+    const npxCli = findNpxCli(execPath);
+    return npxCli
+        ? { bin: execPath, prefixArgs: [npxCli, "--yes", "tsx"], usedNpx: true }
+        : { bin: "npx", prefixArgs: ["--yes", "tsx"], usedNpx: true };
 }
 
 /**
