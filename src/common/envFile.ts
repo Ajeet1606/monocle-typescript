@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { parseEnv } from "util";
+import * as util from "util";
 import { consoleLog } from "./logging";
 
 /** Monocle's own settings file, kept out of the app's .env. */
@@ -27,8 +27,10 @@ export type EnvFileOutcome = "loaded" | "absent" | "unsupported" | "failed";
 export function loadMonocleEnvFile(dir: string = process.cwd()): EnvFileOutcome {
     const file = path.join(dir, MONOCLE_ENV_FILE);
 
-    // parseEnv arrived in Node 20.12 / 21.7; older runtimes go without.
-    if (typeof parseEnv !== "function") {
+    // parseEnv arrived in Node 20.12 / 21.7; older runtimes go without. Reached
+    // through the namespace: a named import of a missing builtin export is a
+    // load-time SyntaxError in ESM, which would take the preload down with it.
+    if (typeof util.parseEnv !== "function") {
         consoleLog(`[monocle] this Node cannot read ${MONOCLE_ENV_FILE}`);
         return "unsupported";
     }
@@ -37,7 +39,7 @@ export function loadMonocleEnvFile(dir: string = process.cwd()): EnvFileOutcome 
     }
 
     try {
-        const settings = parseEnv(fs.readFileSync(file, "utf8"));
+        const settings = util.parseEnv(fs.readFileSync(file, "utf8"));
         for (const [key, value] of Object.entries(settings)) {
             if (typeof value === "string") {
                 process.env[key] = value;
