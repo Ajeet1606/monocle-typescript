@@ -33,16 +33,38 @@ describe('loadMonocleEnvFile', () => {
     expect(process.env.MONOCLE_WORKFLOW_NAME).toBe('my-agent');
   });
 
-  // The app's own .env is loaded by Node before startup and CI sets real
-  // variables, so this file is the lowest priority of the three.
-  it('leaves a variable that is already set alone', () => {
+  // This file is where Monocle's settings live, so it is authoritative. It
+  // has to override: the preload runs in every process tsx spawns, and only
+  // the last of them applies --env-file, so leaving set variables alone made
+  // .env win under plain node and lose under tsx for the very same project.
+  it('overrides a variable that is already set', () => {
     process.env.MONOCLE_EXPORTER = 'okahu';
     writeEnvFile('MONOCLE_EXPORTER=file\nMONOCLE_DEBUG=true\n');
 
     loadMonocleEnvFile(root);
 
-    expect(process.env.MONOCLE_EXPORTER).toBe('okahu');
+    expect(process.env.MONOCLE_EXPORTER).toBe('file');
     expect(process.env.MONOCLE_DEBUG).toBe('true');
+  });
+
+  it('leaves variables the file does not mention alone', () => {
+    process.env.MONOCLE_DEBUG = 'true';
+    writeEnvFile('MONOCLE_EXPORTER=file\n');
+
+    loadMonocleEnvFile(root);
+
+    expect(process.env.MONOCLE_DEBUG).toBe('true');
+  });
+
+  // Parsed with Node's own rules, so this file and --env-file never disagree
+  // about what a line means.
+  it('parses the file the way --env-file does', () => {
+    writeEnvFile('export MONOCLE_EXPORTER=file\n# a comment\nMONOCLE_FILE_PREFIX="two words"\n');
+
+    loadMonocleEnvFile(root);
+
+    expect(process.env.MONOCLE_EXPORTER).toBe('file');
+    expect(process.env.MONOCLE_FILE_PREFIX).toBe('two words');
   });
 
   it('reads the file beside the directory it is given, not the process cwd', () => {
