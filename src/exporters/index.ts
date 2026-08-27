@@ -25,7 +25,10 @@ function getMonocleExporters(exporter_list: string = null, options: GetMonocleEx
         consoleLog('getMonocleExporters| Using LambdaExportTaskProcessor for AWS Lambda environment');
         getMonocleExporterOptions.taskProcessor = new LambdaExportTaskProcessor();
     }
-    const exporterNameList = (exporter_list || process.env.MONOCLE_EXPORTER || 'console').split(',');
+    // Files rather than the console: spans printed to a terminal are gone once
+    // the scrollback rolls, and a run started from an editor may have no visible
+    // terminal at all. They land in .monocle/ and can be read back afterwards.
+    const exporterNameList = (exporter_list || process.env.MONOCLE_EXPORTER || 'file').split(',');
     consoleLog(`getMonocleExporters| Initializing exporters with config: ${exporterNameList}`);
 
     let exporters = [];
