@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
-import { context } from '@opentelemetry/api';
+import { context, trace } from '@opentelemetry/api';
 import { AsyncHooksContextManager } from '@opentelemetry/context-async-hooks';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -8,6 +8,7 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { getPatchedMain } from '../../src/instrumentation/common/wrapper';
 import { setScopesInternal } from '../../src/instrumentation/common/utils';
 import { config as agentsConfig } from '../../src/instrumentation/metamodel/agents/methods';
+import { config as openaiConfig } from '../../src/instrumentation/metamodel/openai/methods';
 
 // Drives the real monocle pipeline end to end: the actual wrapper
 // (getPatchedMain), the real agents MethodConfig, and OTel span emission through
@@ -101,6 +102,28 @@ function patchRunner() {
         const patched = getPatchedMain({ ...entry, tracer } as any)(FakeRunner.prototype.run);
         (patched as any).__monoclePatched = true;
         FakeRunner.prototype.run = patched as any;
+    }
+}
+
+// Stands in for openai's Responses resource, patched with the real openai config
+// entry so the inference span takes the same path a live run does.
+class FakeResponses {
+    async create(_params: any) {
+        return {
+            model: 'gpt-4o',
+            output_text: 'It is sunny.',
+            usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18 },
+        };
+    }
+}
+
+function patchOpenAIResponses() {
+    const entry = (openaiConfig as any[]).find((c) => c.spanName === 'openai_responses');
+    if (!entry) throw new Error('no openai config entry for openai_responses');
+    if (!(FakeResponses.prototype.create as any).__monoclePatched) {
+        const patched = getPatchedMain({ ...entry, tracer } as any)(FakeResponses.prototype.create);
+        (patched as any).__monoclePatched = true;
+        FakeResponses.prototype.create = patched as any;
     }
 }
 
@@ -500,4 +523,70 @@ describe('@openai/agents instrumentation', () => {
         expect(turns).toHaveLength(2);
         expect(parentIdOf(alphaSpan)).not.toBe(parentIdOf(betaSpan));
     });
+
+    it('parents the model-API inference span to the agent invocation that made it', async () => {
+        patchRunner();
+        patchOpenAIResponses();
+        const agent = fakeAgent('Weather Assistant');
+
+        const runner = new FakeRunner(
+            async (r, ctx) => {
+                r.emit('agent_start', ctx, agent, []);
+                // Instrumented by the openai metamodel, not by this bridge.
+                await new FakeResponses().create({ model: 'gpt-4o', input: 'weather?' });
+                r.emit('agent_end', ctx, agent, 'It is sunny.');
+            },
+            { finalOutput: 'It is sunny.' },
+        );
+
+        await runner.run(agent, 'weather?');
+
+        const inference = spansByName('openai_responses');
+        expect(inference, 'expected the openai inference span').toHaveLength(1);
+
+        const invocation = spansByName('openai_agents.agent')[0];
+        // Without the pointer this parents to the turn span instead.
+        expect(parentIdOf(inference[0])).toBe(invocation.spanContext().spanId);
+        expect(inference[0].attributes['scope.agentic.invocation'])
+            .toBe(invocation.attributes['scope.agentic.invocation']);
+    });
+
+    it('leaves a model-API call outside any agent run untouched', async () => {
+        patchOpenAIResponses();
+
+        await new FakeResponses().create({ model: 'gpt-4o', input: 'plain call' });
+
+        const inference = spansByName('openai_responses')[0];
+        expect(inference, 'expected the openai inference span').toBeDefined();
+        // No agents run is live, so the pointer must not fire.
+        expect(inference.attributes['scope.agentic.invocation']).toBeUndefined();
+        expect(inference.attributes['span.type']).toBe('inference');
+    });
+
+    it('stops re-parenting once the invocation has closed', async () => {
+        patchRunner();
+        patchOpenAIResponses();
+        const agent = fakeAgent('Solo');
+
+        const runner = new FakeRunner(
+            async (r, ctx) => {
+                r.emit('agent_start', ctx, agent, []);
+                r.emit('agent_end', ctx, agent, 'done');
+                // The activation is over; must not attach to an ended span.
+                await new FakeResponses().create({ model: 'gpt-4o', input: 'after' });
+            },
+            { finalOutput: 'done' },
+        );
+
+        await runner.run(agent, 'hello');
+
+        const inference = spansByName('openai_responses')[0];
+        const invocation = spansByName('openai_agents.agent')[0];
+        const turn = spansByName('openai_agents.runner.run')[0];
+
+        expect(parentIdOf(inference)).not.toBe(invocation.spanContext().spanId);
+        expect(parentIdOf(inference)).toBe(turn.spanContext().spanId);
+        expect(inference.attributes['scope.agentic.invocation']).toBeUndefined();
+    });
+
 });

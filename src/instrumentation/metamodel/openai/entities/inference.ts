@@ -1,6 +1,8 @@
 import { context } from "@opentelemetry/api";
-import { INFERENCE_COMMUNICATION, WORKFLOW_TYPE_GENERIC, WORKFLOW_TYPE_KEY_SYMBOL, WrapperArguments } from "../../../common/constants";
+import { INFERENCE_COMMUNICATION, MONOCLE_ACTIVE_SPAN_KEY, SCOPE_AGENTIC_INVOCATION, WORKFLOW_TYPE_GENERIC, WORKFLOW_TYPE_KEY_SYMBOL, WrapperArguments } from "../../../common/constants";
 import { NonFrameworkSpanHandler } from "../../../common/spanHandler";
+import { getOpenAgentInvocation } from "../../../common/agenticInvocation";
+import { updateBaggageContextWithScopes } from "../../../common/utils";
 import { Span } from "../../../common/opentelemetryUtils";
 import { getExceptionMessage, getStatus, getStatusCode } from "../../utils";
 import { mapOpenaiFinishReasonToFinishType } from "../../finishType";
@@ -342,6 +344,23 @@ export class OpenAISpanHandler extends NonFrameworkSpanHandler {
     constructor({ deferToFrameworkSpan = true }: { deferToFrameworkSpan?: boolean } = {}) {
         super();
         this.deferToFrameworkSpan = deferToFrameworkSpan;
+    }
+
+    // A model call inside an agent invocation belongs to it, but that span is
+    // not on the OTel context (see agenticInvocation), so name it as the parent
+    // explicitly and carry its scope across. Inert outside an agentic run.
+    preTracing(element: WrapperArguments, currentContext: any, thisArg?: any): any {
+        const invocation = getOpenAgentInvocation(currentContext);
+        if (!invocation) {
+            return super.preTracing(element, currentContext, thisArg);
+        }
+        let updated = currentContext.setValue(MONOCLE_ACTIVE_SPAN_KEY, invocation.span);
+        if (invocation.scopeId) {
+            updated = updateBaggageContextWithScopes(updated, {
+                [SCOPE_AGENTIC_INVOCATION]: invocation.scopeId,
+            });
+        }
+        return updated;
     }
 
     isTeamsSpanInProgress() {

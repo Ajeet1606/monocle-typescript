@@ -6,7 +6,8 @@ import {
     WrapperArguments,
 } from "../../common/constants";
 import { DefaultSpanHandler } from "../../common/spanHandler";
-import { updateBaggageContextWithScopes } from "../../common/utils";
+import { clearOpenAgentInvocation, setOpenAgentInvocation } from "../../common/agenticInvocation";
+import { getScopeFromContext, updateBaggageContextWithScopes } from "../../common/utils";
 import { consoleLog } from "../../../common/logging";
 import { AGENT } from "./entities/agentInvocation";
 import { TOOL } from "./entities/tools";
@@ -20,7 +21,9 @@ import { TOOL } from "./entities/tools";
 //   agent_tool_start(runContext, agent, tool, { toolCall })
 //   agent_tool_end(runContext, agent, tool, result, { toolCall })
 //
-// A delegating agent gets no agent_end — the handoff ends its activation.
+// One activation is tracked at a time. A handoff replaces it: the delegating
+// agent receives no agent_end, so agent_handoff ends its activation and carries
+// the provenance forward. Nested activations (agent.asTool()) are out of scope.
 //
 // Spans take an explicit parent: a listener returns immediately, so it cannot
 // wrap the agent's later work in a context.with frame.
@@ -33,6 +36,7 @@ interface InvocationRecord {
     // Retained so attributes are read with this activation's scopes active, and
     // so tool spans nest under it.
     spanContext: Context;
+    scopeId?: string;
     agent: any;
     turnInput: any;
     handoffFrom?: { fromAgent: string; fromAgentSpanId: string };
@@ -60,14 +64,12 @@ interface RunState {
     tools: Map<string, ToolRecord>;
 }
 
-// Keyed by the SDK's RunContext: one instance per run, passed to every event.
-// This identifies a run even when no turn span exists, and keeps concurrent runs
-// on a shared Runner apart. Weak so state is collectable if cleanup never runs.
+// Keyed by the SDK's RunContext, which is passed to every event.
 const runStates = new WeakMap<object, RunState>();
 
-// Lets the turn span's postProcessSpan find its run to force-close what is still
-// open. Only populated when there is a turn span.
-const turnToRunContext = new Map<Span, object>();
+// Lets the turn span's postProcessSpan find its run to force-close what is
+// still open.
+const turnStates = new Map<Span, RunState>();
 
 // One listener set per Runner: the module-level run() reuses a singleton Runner,
 // so attaching per call would leak listeners or detach them from a live run.
@@ -90,20 +92,35 @@ function activeTurnSpan(): Span | undefined {
 function stateFor(runContext: any, element: WrapperArguments, tracer: Tracer):
     RunState | undefined {
     if (!runContext || typeof runContext !== "object") return undefined;
-    let state = runStates.get(runContext);
-    if (!state) {
-        const turn = activeTurnSpan();
-        state = { tracer, element, turn, tools: new Map() };
-        runStates.set(runContext, state);
-        if (turn) {
-            turnToRunContext.set(turn, runContext);
-        }
+    const existing = runStates.get(runContext);
+    if (existing) return existing;
+
+    const turn = activeTurnSpan();
+    const state: RunState = { tracer, element, turn, tools: new Map() };
+    runStates.set(runContext, state);
+    // First run to claim this turn owns the cleanup slot.
+    if (turn && !turnStates.has(turn)) {
+        turnStates.set(turn, state);
     }
     return state;
 }
 
+// Republishes the open activation for the model-API span, which is
+// created by another metamodel and cannot discover it on its own.
+function publishCurrentInvocation(state: RunState) {
+    if (!state.turn) return;
+    if (state.invocation) {
+        setOpenAgentInvocation(state.turn, {
+            span: state.invocation.span,
+            scopeId: state.invocation.scopeId,
+        });
+    } else {
+        clearOpenAgentInvocation(state.turn);
+    }
+}
+
 // Runs a bridge-created span through the same pipeline as a wrapped call, so
-// entities, events and scope attributes behave identically.
+// entities, events and scopes behave identically.
 function fillAndEnd(
     span: Span,
     spanContext: Context,
@@ -115,7 +132,7 @@ function fillAndEnd(
 ) {
     try {
         // context.with is required: scopes are read off the globally active
-        // baggage (getScopesInternal), not from a context passed in.
+        // baggage (getScopesInternal), not from a passed-in context.
         context.with(spanContext, () => {
             spanHandler.setDefaultMonocleAttributes({
                 span,
@@ -140,10 +157,38 @@ function fillAndEnd(
     }
 }
 
-function closeInvocation(state: RunState, result: Record<string, any>) {
+function openInvocation(state: RunState, agent: any, turnInput: any) {
+    // Activations hang off the turn, or off the ambient context when skipSpan
+    // suppressed the turn span.
+    const parentContext = state.turn
+        ? trace.setSpan(context.active(), state.turn)
+        : context.active();
+
+    // Each activation is its own invocation scope. null → auto-generate.
+    const spanContext = updateBaggageContextWithScopes(parentContext, {
+        [SCOPE_AGENTIC_INVOCATION]: null,
+    });
+    const span = state.tracer.startSpan(INVOCATION_SPAN_NAME, {}, spanContext) as Span;
+
+    state.invocation = {
+        span,
+        spanContext,
+        scopeId: getScopeFromContext(spanContext, SCOPE_AGENTIC_INVOCATION),
+        agent,
+        turnInput,
+        handoffFrom: state.pendingHandoff,
+    };
+    state.pendingHandoff = undefined;
+    publishCurrentInvocation(state);
+}
+
+// Returns the closed record so a handoff can stamp its span id on the next
+// activation.
+function closeInvocation(state: RunState, result: Record<string, any>): InvocationRecord | undefined {
     const invocation = state.invocation;
-    if (!invocation) return;
+    if (!invocation) return undefined;
     state.invocation = undefined;
+    publishCurrentInvocation(state);
     fillAndEnd(
         invocation.span,
         invocation.spanContext,
@@ -157,27 +202,7 @@ function closeInvocation(state: RunState, result: Record<string, any>) {
             fromAgentSpanId: invocation.handoffFrom?.fromAgentSpanId,
         },
     );
-}
-
-function openInvocation(state: RunState, agent: any, turnInput: any) {
-    // Without a turn span, fall back to the ambient context so the activation
-    // lands under the app's own span, or starts a root span if there is none.
-    const parentContext = state.turn
-        ? trace.setSpan(context.active(), state.turn)
-        : context.active();
-    // Each activation is its own invocation scope. null → auto-generate.
-    const spanContext = updateBaggageContextWithScopes(parentContext, {
-        [SCOPE_AGENTIC_INVOCATION]: null,
-    });
-    const span = state.tracer.startSpan(INVOCATION_SPAN_NAME, {}, spanContext) as Span;
-    state.invocation = {
-        span,
-        spanContext,
-        agent,
-        turnInput,
-        handoffFrom: state.pendingHandoff,
-    };
-    state.pendingHandoff = undefined;
+    return invocation;
 }
 
 function closeTool(state: RunState, record: ToolRecord, result: Record<string, any>) {
@@ -216,12 +241,11 @@ function openTool(state: RunState, agent: any, tool: any, toolCall: any) {
 
 // Closes anything still open and drops the run's state.
 export function endRun(turn: Span) {
-    const runContext = turnToRunContext.get(turn);
-    if (!runContext) return;
-    turnToRunContext.delete(turn);
-    const state = runStates.get(runContext);
+    const state = turnStates.get(turn);
     if (!state) return;
-    runStates.delete(runContext);
+    turnStates.delete(turn);
+    clearOpenAgentInvocation(turn);
+
     for (const record of state.tools.values()) {
         record.span.setStatus({
             code: SpanStatusCode.ERROR,
@@ -230,6 +254,7 @@ export function endRun(turn: Span) {
         closeTool(state, record, {});
     }
     state.tools.clear();
+
     if (state.invocation) {
         state.invocation.span.setStatus({
             code: SpanStatusCode.ERROR,
@@ -257,9 +282,10 @@ export function attachRunnerHooks(runner: any, element: WrapperArguments, tracer
         guard("agent_start", () => {
             const state = stateFor(runContext, element, tracer);
             if (!state) return;
-            // The SDK moved on without ending the previous activation.
+            // Only an unsupported nested activation arrives with one already
+            // open. Close it rather than leak the span, recording no handoff.
             if (state.invocation) {
-                closeInvocation(state, { handoffTo: agent?.name || "" });
+                closeInvocation(state, {});
             }
             openInvocation(state, agent, turnInput);
         });
@@ -293,18 +319,19 @@ export function attachRunnerHooks(runner: any, element: WrapperArguments, tracer
         });
     });
 
-    // Ends the delegating agent's activation, and holds its provenance for the
-    // next agent_start — the delegated agent.
+    // Ends the delegating agent's activation and holds its provenance for the
+    // next agent_start, the delegated agent.
     runner.on("agent_handoff", (runContext: any, fromAgent: any, toAgent: any) => {
         guard("agent_handoff", () => {
             const state = stateFor(runContext, element, tracer);
             if (!state) return;
-            // Read the span id before the span closes.
-            const fromAgentSpanId = state.invocation?.span.spanContext().spanId;
             const fromName = fromAgent?.name || state.invocation?.agent?.name || "";
-            closeInvocation(state, { handoffTo: toAgent?.name || "" });
-            if (fromAgentSpanId) {
-                state.pendingHandoff = { fromAgent: fromName, fromAgentSpanId };
+            const closed = closeInvocation(state, { handoffTo: toAgent?.name || "" });
+            if (closed) {
+                state.pendingHandoff = {
+                    fromAgent: fromName,
+                    fromAgentSpanId: closed.span.spanContext().spanId,
+                };
             }
         });
     });
