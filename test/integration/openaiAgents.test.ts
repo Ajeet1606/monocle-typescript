@@ -139,7 +139,7 @@ function parentIdOf(span: any): string | undefined {
 // --- Tests ------------------------------------------------------------------
 
 describe('@openai/agents instrumentation', () => {
-    it('emits an agentic.request turn span for Runner.run', async () => {
+    it('emits an agentic.turn span for Runner.run', async () => {
         patchRunner();
         const agent = fakeAgent('Solo');
         const runner = new FakeRunner(
@@ -155,7 +155,7 @@ describe('@openai/agents instrumentation', () => {
 
         const turnSpans = spansByName('openai_agents.runner.run');
         expect(turnSpans, 'expected one openai_agents.runner.run span').toHaveLength(1);
-        expect(turnSpans[0].attributes['span.type']).toBe('agentic.request');
+        expect(turnSpans[0].attributes['span.type']).toBe('agentic.turn');
         expect(turnSpans[0].attributes['span.subtype']).toBe('turn');
     });
 

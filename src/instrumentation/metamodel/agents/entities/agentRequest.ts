@@ -1,10 +1,11 @@
 import { SPAN_SUBTYPES, SPAN_TYPES } from "../../../common/constants";
 import { AGENTS_AGENT_TYPE, extractRunInput, extractRunOutput } from "../agentsHelper";
 
-// One Runner.run call = one agentic turn, the outermost agents span.
+// One Runner.run call = one agentic turn, the outermost agents span. Typed
+// agentic.turn to match the ADK and Mastra request spans.
 // Args are Runner.run's own: (agent, input, options?).
 export const AGENT_REQUEST = {
-    "type": SPAN_TYPES.AGENTIC_REQUEST,
+    "type": SPAN_TYPES.AGENTIC_TURN,
     "subtype": SPAN_SUBTYPES.TURN,
     "attributes": [
         [
