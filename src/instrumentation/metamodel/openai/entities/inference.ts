@@ -1,5 +1,5 @@
 import { context } from "@opentelemetry/api";
-import { INFERENCE_COMMUNICATION, MONOCLE_ACTIVE_SPAN_KEY, SCOPE_AGENTIC_INVOCATION, WORKFLOW_TYPE_GENERIC, WORKFLOW_TYPE_KEY_SYMBOL, WrapperArguments } from "../../../common/constants";
+import { INFERENCE_TOOL_CALL, INFERENCE_TURN_END, MONOCLE_ACTIVE_SPAN_KEY, SCOPE_AGENTIC_INVOCATION, WORKFLOW_TYPE_GENERIC, WORKFLOW_TYPE_KEY_SYMBOL, WrapperArguments } from "../../../common/constants";
 import { NonFrameworkSpanHandler } from "../../../common/spanHandler";
 import { getOpenAgentInvocation } from "../../../common/agenticInvocation";
 import { updateBaggageContextWithScopes } from "../../../common/utils";
@@ -8,11 +8,27 @@ import { getExceptionMessage, getStatus, getStatusCode } from "../../utils";
 import { mapOpenaiFinishReasonToFinishType } from "../../finishType";
 
 
+// The Responses API has no finish_reason and reports status "completed" for a
+// tool call just as for text, so the signal has to come off output[].
+function emittedToolCall(response: any): boolean {
+    if (Array.isArray(response?.output)
+        && response.output.some((item: any) =>
+            item?.type === "function_call" || item?.type === "custom_tool_call")) {
+        return true;
+    }
+    return Boolean(response?.choices?.[0]?.message?.tool_calls?.length);
+}
+
 function extractFinishReason(response: any): string | null {
     try {
         // Handle traditional chat.completions.create() format
         if (response && response.choices && response.choices[0] && response.choices[0].finish_reason) {
             return response.choices[0].finish_reason;
+        }
+
+        // Check what was emitted before falling back to the status mapping.
+        if (emittedToolCall(response)) {
+            return "tool_calls";
         }
 
         // Handle new responses.create() format
@@ -368,9 +384,13 @@ export const config = {
                     }
                 },
                 {
+                    "_comment": "tool_call when the turn emitted tool calls, else turn_end",
                     "attribute": "inference_sub_type",
-                    "accessor": function () {
-                        return INFERENCE_COMMUNICATION || "";
+                    "accessor": function ({ response }) {
+                        const finishReason = extractFinishReason(response);
+                        return finishReason === "tool_calls" || finishReason === "function_call"
+                            ? INFERENCE_TOOL_CALL
+                            : INFERENCE_TURN_END;
                     }
                 }
             ]
