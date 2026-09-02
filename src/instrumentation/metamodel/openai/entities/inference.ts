@@ -163,6 +163,46 @@ function processStream({ element, returnValue, spanProcessor }) {
     }
 }
 
+// What the model emitted this turn: text, tool calls, or both, in order. A
+// tool-calling turn spends its tokens on the call, so reading text alone records
+// nothing for it. Tool-call shape matches the Mastra metamodel.
+function collectModelOutput(response: any): string[] {
+    const parts: string[] = [];
+
+    // Responses API: output[] holds the emitted items in order.
+    if (Array.isArray(response?.output)) {
+        for (const item of response.output) {
+            if (item?.type === "function_call" || item?.type === "custom_tool_call") {
+                parts.push(JSON.stringify({ name: item.name, arguments: item.arguments }));
+                continue;
+            }
+            if (Array.isArray(item?.content)) {
+                const text = item.content
+                    .filter((part: any) => typeof part?.text === "string")
+                    .map((part: any) => part.text)
+                    .join("");
+                if (text) {
+                    parts.push(text);
+                }
+            }
+        }
+    }
+
+    // chat.completions: content and tool_calls sit on the message together.
+    const message = response?.choices?.[0]?.message;
+    if (message) {
+        if (typeof message.content === "string" && message.content) {
+            parts.push(message.content);
+        }
+        for (const call of message.tool_calls ?? []) {
+            const fn = call?.function ?? call;
+            parts.push(JSON.stringify({ name: fn?.name, arguments: fn?.arguments }));
+        }
+    }
+
+    return parts;
+}
+
 export const config = {
     "type": "inference",
     "attributes": [
@@ -268,6 +308,11 @@ export const config = {
                         if (exception) {
                             return getExceptionMessage({ exception });
                         }
+                        const emitted = collectModelOutput(response);
+                        if (emitted.length) {
+                            return [emitted.join(" ")];
+                        }
+                        // Streaming accumulates onto output_text with no output[].
                         if (response?.output_text !== undefined) {
                             return [response.output_text];
                         }
